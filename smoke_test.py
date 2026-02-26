@@ -5,54 +5,53 @@ Requires the server to be running:
     uv run mlx-server
 
 Run this script with:
-    uv run python smoke_test.py [--test inference|hf|gguf|all]
+    uv run python smoke_test.py [options]
 
 Tests:
-  inference — register a pre-built MLX model and run a chat completion
-  hf        — convert SmolLM2-135M from HF then run inference
-  gguf      — convert a local GGUF (DeepSeek-R1-1.5B) then run inference
+  inference — register a pre-built MLX model (downloaded from HF) and run chat
+  hf        — convert SmolLM2-135M from HF to MLX, then run inference
+  gguf      — convert a local GGUF file to MLX, then run inference
+              Requires --gguf-path and --gguf-tokenizer
+
+Examples:
+    uv run python smoke_test.py --test inference
+    uv run python smoke_test.py --test hf
+    uv run python smoke_test.py --test gguf \\
+        --gguf-path /path/to/model.gguf \\
+        --gguf-tokenizer meta-llama/Llama-3.2-1B-Instruct
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import sys
 import time
 from pathlib import Path
 
 import requests
 
-BASE = "http://localhost:1234"
-
 # ---------------------------------------------------------------------------
-# Tiny models used in each test
+# Constants
 # ---------------------------------------------------------------------------
 
 # Tiny public HF model — mlx_lm loads HF format directly (no pre-conversion needed)
 INFERENCE_HF_REPO = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
-# Non-MLX HF model to run through convert_from_hf
-HF_CONVERT_REPO   = "HuggingFaceTB/SmolLM2-135M-Instruct"
+# Tiny non-MLX HF model to run through convert_from_hf
+HF_CONVERT_REPO = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
-# Local GGUF on NAS — update path if needed
-GGUF_PATH = "/Volumes/jvnas/LLM_models/lmstudio-community/Ministral-3-14B-Reasoning-2512-GGUF/Ministral-3-14B-Reasoning-2512-Q8_0.gguf"
-GGUF_TOKENIZER = "mistralai/Mistral-Nemo-Instruct-2407"  # Ministral-3 uses the Nemo tokenizer
 
-# Output dirs — default to MLX_MODEL_DIR (set in env or server config)
 def _model_dir() -> Path:
-    """Respects MLX_MODEL_DIR env var, same as the server."""
-    import os
+    """Output directory for converted models. Respects MLX_MODEL_DIR env var."""
     d = os.environ.get("MLX_MODEL_DIR")
     return Path(d) if d else Path.home() / ".cache" / "mlx-server" / "models"
-
-HF_CONVERT_OUT   = str(_model_dir() / "test-smollm2-135m")
-GGUF_CONVERT_OUT = str(_model_dir() / "ministral-14b-mlx")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _check(resp: requests.Response, label: str) -> dict:
     if not resp.ok:
@@ -68,17 +67,17 @@ def _check(resp: requests.Response, label: str) -> dict:
 
 
 def _poll_interval(size_gb: float) -> int:
-    """Poll interval based on model size — small models check often, large ones wait."""
+    """Poll interval based on source model size."""
     if size_gb < 1:
         return 5
     if size_gb < 5:
         return 20
     if size_gb < 15:
-        return 120   # ~2 min — shard writes to NAS take several minutes
-    return 300       # 5 min — very large models
+        return 120
+    return 300
 
 
-def _wait_for_job(job_id: str, size_gb: float = 0.1, timeout: int = 7200) -> dict:
+def _wait_for_job(job_id: str, base: str, size_gb: float = 0.1, timeout: int = 7200) -> dict:
     """Poll until job is completed or failed."""
     interval = _poll_interval(size_gb)
     start = time.time()
@@ -88,7 +87,7 @@ def _wait_for_job(job_id: str, size_gb: float = 0.1, timeout: int = 7200) -> dic
     while True:
         elapsed = int(time.time() - start)
         try:
-            resp = requests.get(f"{BASE}/v1/convert/{job_id}", timeout=30)
+            resp = requests.get(f"{base}/v1/convert/{job_id}", timeout=30)
             job = resp.json()
         except (requests.ConnectionError, requests.ReadTimeout):
             print(f"\n  ! server slow/unreachable at {elapsed}s — retrying...")
@@ -118,8 +117,8 @@ def _wait_for_job(job_id: str, size_gb: float = 0.1, timeout: int = 7200) -> dic
         time.sleep(interval)
 
 
-def _chat(model_id: str, prompt: str = "Say 'hello' in exactly one word.") -> str:
-    resp = requests.post(f"{BASE}/v1/chat/completions", json={
+def _chat(model_id: str, base: str, prompt: str = "Say 'hello' in exactly one word.") -> str:
+    resp = requests.post(f"{base}/v1/chat/completions", json={
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 16,
@@ -135,7 +134,6 @@ def _download_mlx_model(hf_repo: str) -> str:
     """Download a model via huggingface_hub and return local path."""
     from huggingface_hub import snapshot_download
     print(f"  Downloading {hf_repo} ...")
-    # token=False → explicit anonymous access (avoids 401 from stale env tokens)
     path = snapshot_download(repo_id=hf_repo, token=False)
     print(f"  Downloaded to {path}")
     return path
@@ -145,20 +143,19 @@ def _download_mlx_model(hf_repo: str) -> str:
 # Test: direct inference with a pre-built MLX model
 # ---------------------------------------------------------------------------
 
-def test_inference():
+
+def test_inference(base: str) -> None:
     print("\n=== TEST: inference ===")
 
-    model_id = "smollm2-135m-test"
+    model_id = "smoke-inference"
 
-    # 1. Check if already registered (idempotent)
-    resp = requests.get(f"{BASE}/v1/models/{model_id}")
+    resp = requests.get(f"{base}/v1/models/{model_id}")
     if resp.status_code == 200:
         print(f"  {model_id} already registered, skipping download")
-        local_path = resp.json()["path"]
     else:
         local_path = _download_mlx_model(INFERENCE_HF_REPO)
         _check(
-            requests.post(f"{BASE}/v1/models/register", json={
+            requests.post(f"{base}/v1/models/register", json={
                 "id": model_id,
                 "path": local_path,
                 "type": "generative",
@@ -166,8 +163,7 @@ def test_inference():
             f"POST /v1/models/register id={model_id}",
         )
 
-    # 2. Chat
-    _chat(model_id)
+    _chat(model_id, base)
     print("  PASS inference")
 
 
@@ -175,17 +171,18 @@ def test_inference():
 # Test: HF conversion
 # ---------------------------------------------------------------------------
 
-def test_hf_conversion():
+
+def test_hf_conversion(base: str) -> None:
     print("\n=== TEST: hf conversion ===")
 
-    model_id = "smollm2-135m-converted"
-    out = Path(HF_CONVERT_OUT)
+    model_id = "smoke-hf-converted"
+    out = _model_dir() / "smoke-hf-converted"
 
     if out.exists():
         print(f"  Output already exists: {out}")
     else:
         resp = _check(
-            requests.post(f"{BASE}/v1/convert/hf", json={
+            requests.post(f"{base}/v1/convert/hf", json={
                 "hf_repo": HF_CONVERT_REPO,
                 "output_path": str(out),
                 "model_type": "generative",
@@ -196,13 +193,12 @@ def test_hf_conversion():
             "POST /v1/convert/hf",
         )
         print(f"  Job: {resp['job_id']}")
-        _wait_for_job(resp["job_id"])  # HF: small model, default size
+        _wait_for_job(resp["job_id"], base)
 
-    # Register if not already (job may have done it)
-    resp = requests.get(f"{BASE}/v1/models/{model_id}")
+    resp = requests.get(f"{base}/v1/models/{model_id}")
     if resp.status_code != 200:
         _check(
-            requests.post(f"{BASE}/v1/models/register", json={
+            requests.post(f"{base}/v1/models/register", json={
                 "id": model_id,
                 "path": str(out),
                 "type": "generative",
@@ -210,7 +206,7 @@ def test_hf_conversion():
             f"POST /v1/models/register id={model_id}",
         )
 
-    _chat(model_id)
+    _chat(model_id, base)
     print("  PASS hf conversion")
 
 
@@ -218,39 +214,40 @@ def test_hf_conversion():
 # Test: GGUF conversion
 # ---------------------------------------------------------------------------
 
-def test_gguf_conversion():
+
+def test_gguf_conversion(base: str, gguf_path: str, gguf_tokenizer: str) -> None:
     print("\n=== TEST: gguf conversion ===")
 
-    if not Path(GGUF_PATH).exists():
-        print(f"  SKIP — GGUF not found at {GGUF_PATH}")
-        print("         Update GGUF_PATH at the top of this script.")
-        return
+    gguf = Path(gguf_path)
+    if not gguf.exists():
+        print(f"  FAIL — GGUF not found: {gguf_path}")
+        sys.exit(1)
 
-    model_id = "deepseek-r1-1.5b-mlx"
-    out = Path(GGUF_CONVERT_OUT)
+    # Derive a stable model ID and output dir from the GGUF filename
+    model_id = f"smoke-gguf-{gguf.stem[:32].lower().replace('_', '-')}"
+    out = _model_dir() / model_id
 
     if out.exists():
         print(f"  Output already exists: {out}")
     else:
+        gguf_size_gb = gguf.stat().st_size / 1024 ** 3
         resp = _check(
-            requests.post(f"{BASE}/v1/convert/gguf", json={
-                "gguf_path": GGUF_PATH,
-                "hf_tokenizer_repo": GGUF_TOKENIZER,
+            requests.post(f"{base}/v1/convert/gguf", json={
+                "gguf_path": str(gguf),
+                "hf_tokenizer_repo": gguf_tokenizer,
                 "output_path": str(out),
-                "quantize": False,   # Q8_0 source — already quantized, skip re-quant
+                "quantize": False,
                 "register_as": model_id,
             }),
             "POST /v1/convert/gguf",
         )
-        gguf_size_gb = Path(GGUF_PATH).stat().st_size / 1024 ** 3
-        print(f"  Job: {resp['job_id']}")
-        _wait_for_job(resp["job_id"], size_gb=gguf_size_gb)
+        print(f"  Job: {resp['job_id']}  ({gguf_size_gb:.1f} GB, polling every {_poll_interval(gguf_size_gb)}s)")
+        _wait_for_job(resp["job_id"], base, size_gb=gguf_size_gb)
 
-    # Register if needed
-    resp = requests.get(f"{BASE}/v1/models/{model_id}")
+    resp = requests.get(f"{base}/v1/models/{model_id}")
     if resp.status_code != 200:
         _check(
-            requests.post(f"{BASE}/v1/models/register", json={
+            requests.post(f"{base}/v1/models/register", json={
                 "id": model_id,
                 "path": str(out),
                 "type": "generative",
@@ -258,7 +255,7 @@ def test_gguf_conversion():
             f"POST /v1/models/register id={model_id}",
         )
 
-    _chat(model_id)
+    _chat(model_id, base)
     print("  PASS gguf conversion")
 
 
@@ -266,29 +263,35 @@ def test_gguf_conversion():
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--test",
-        choices=["inference", "hf", "gguf", "all"],
-        default="all",
-    )
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Smoke test for the MLX server.")
+    parser.add_argument("--base-url", default="http://localhost:8080",
+                        help="Server base URL (default: http://localhost:8080)")
+    parser.add_argument("--test", choices=["inference", "hf", "gguf", "all"], default="all")
+    parser.add_argument("--gguf-path", help="Path to a local GGUF file (required for --test gguf)")
+    parser.add_argument("--gguf-tokenizer", help="HF repo ID for the GGUF tokenizer (required for --test gguf)")
     args = parser.parse_args()
 
-    # Confirm server is up
+    if args.test in ("gguf", "all") and args.test == "gguf":
+        if not args.gguf_path or not args.gguf_tokenizer:
+            parser.error("--test gguf requires --gguf-path and --gguf-tokenizer")
+
+    base = args.base_url.rstrip("/")
+
     try:
-        requests.get(BASE + "/docs", timeout=3)
+        requests.get(base + "/docs", timeout=3)
     except requests.ConnectionError:
-        print(f"Server not reachable at {BASE}")
+        print(f"Server not reachable at {base}")
         print("Start it with: uv run mlx-server")
         sys.exit(1)
 
     if args.test in ("inference", "all"):
-        test_inference()
+        test_inference(base)
     if args.test in ("hf", "all"):
-        test_hf_conversion()
-    if args.test in ("gguf", "all"):
-        test_gguf_conversion()
+        test_hf_conversion(base)
+    if args.test in ("gguf",):
+        test_gguf_conversion(base, args.gguf_path, args.gguf_tokenizer)
 
     print("\nAll selected tests passed.")
 
