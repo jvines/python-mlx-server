@@ -24,7 +24,7 @@ Designed for running multiple local models side-by-side without multiple llama.c
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone <this-repo> && cd python-mlx-server
+git clone https://github.com/jvines/python-mlx-server.git && cd python-mlx-server
 uv sync
 ```
 
