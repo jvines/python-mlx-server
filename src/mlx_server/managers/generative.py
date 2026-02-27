@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -25,6 +27,50 @@ logger = logging.getLogger(__name__)
 # Single-threaded executor: MLX Metal operations serialize on the GPU anyway,
 # and this prevents multiple threads from competing for unified memory.
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx_gen")
+
+
+def _load_with_progress(model_id: str, path: str) -> Tuple[Any, Any]:
+    """
+    Load a model via mlx_lm with per-shard progress logging.
+
+    Temporarily wraps mx.load so each .safetensors shard load is intercepted
+    and logged with a running byte percentage — same approach as llama.cpp.
+    Safe because the generative executor is single-threaded (max_workers=1).
+    """
+    model_path = Path(path)
+    shard_files = sorted(model_path.glob("*.safetensors"))
+    total_bytes = sum(f.stat().st_size for f in shard_files)
+    total_gb = total_bytes / 1024 ** 3
+
+    logger.info("load: model='%s'  size=%.1f GB  path=%s", model_id, total_gb, path)
+
+    if not shard_files or total_bytes == 0:
+        return load(path)
+
+    loaded_bytes = 0
+    original_mx_load = mx.load
+
+    def _tracked_load(fpath, *args, **kwargs):
+        nonlocal loaded_bytes
+        result = original_mx_load(fpath, *args, **kwargs)
+        if str(fpath).endswith(".safetensors"):
+            loaded_bytes += Path(str(fpath)).stat().st_size
+            pct = loaded_bytes / total_bytes * 100
+            logger.info(
+                "load: '%s'  %5.1f%%  (%.2f / %.2f GB)",
+                model_id, pct, loaded_bytes / 1024 ** 3, total_gb,
+            )
+        return result
+
+    mx.load = _tracked_load
+    t0 = time.monotonic()
+    try:
+        model, tokenizer = load(path)
+    finally:
+        mx.load = original_mx_load
+
+    logger.info("load: '%s' ready in %.1fs", model_id, time.monotonic() - t0)
+    return model, tokenizer
 
 
 class GenerativeModelManager:
@@ -41,13 +87,11 @@ class GenerativeModelManager:
     async def load_model(self, model_id: str, path: str) -> Tuple[Any, Any]:
         async with self._lock(model_id):
             if model_id not in self._models:
-                logger.info(f"Loading generative model '{model_id}' from {path}")
                 loop = asyncio.get_running_loop()
                 model, tokenizer = await loop.run_in_executor(
-                    _executor, lambda: load(path)
+                    _executor, lambda: _load_with_progress(model_id, path)
                 )
                 self._models[model_id] = (model, tokenizer)
-                logger.info(f"Model '{model_id}' ready")
         self._last_used[model_id] = time.monotonic()
         return self._models[model_id]
 
@@ -132,28 +176,47 @@ async def _bridge_to_async(make_gen) -> AsyncGenerator[Any, None]:
     """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+    stop_event = threading.Event()
+    done_sentinel = object()
 
     def _worker() -> None:
         try:
             for chunk in make_gen():
-                asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
+                if stop_event.is_set():
+                    break
+                put_future = asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+                while True:
+                    try:
+                        put_future.result(timeout=0.25)
+                        break
+                    except TimeoutError:
+                        if stop_event.is_set():
+                            put_future.cancel()
+                            return
         except Exception as exc:
-            asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result()
+            if not stop_event.is_set():
+                asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result()
         finally:
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+            try:
+                asyncio.run_coroutine_threadsafe(queue.put(done_sentinel), loop).result()
+            except Exception:
+                # Event loop may already be closed/cancelled.
+                pass
 
     worker_future = loop.run_in_executor(_executor, _worker)
 
     try:
         while True:
             item = await queue.get()
-            if item is None:
+            if item is done_sentinel:
                 break
             if isinstance(item, Exception):
                 raise item
             yield item
     finally:
-        await asyncio.shield(worker_future)
+        stop_event.set()
+        if worker_future.done():
+            await asyncio.shield(worker_future)
 
 
 generative_manager = GenerativeModelManager()

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_DEFAULT_MAX_JOBS = 200
+_DEFAULT_RETENTION_SECONDS = 24 * 60 * 60
 
 
 class JobStatus(str, Enum):
@@ -44,10 +46,18 @@ class ConversionJob:
 
 
 class JobManager:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_jobs: int = _DEFAULT_MAX_JOBS,
+        retention_seconds: int = _DEFAULT_RETENTION_SECONDS,
+    ) -> None:
         self._jobs: Dict[str, ConversionJob] = {}
+        self._jobs_lock = threading.Lock()
         self._executor: Optional[ThreadPoolExecutor] = None
         self._executor_lock = threading.Lock()
+        self._max_jobs = max_jobs
+        self._retention_seconds = retention_seconds
 
     def _get_executor(self) -> ThreadPoolExecutor:
         with self._executor_lock:
@@ -58,10 +68,39 @@ class JobManager:
             return self._executor
 
     def get(self, job_id: str) -> Optional[ConversionJob]:
-        return self._jobs.get(job_id)
+        with self._jobs_lock:
+            self._prune_locked()
+            return self._jobs.get(job_id)
 
     def list_all(self) -> List[ConversionJob]:
-        return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+        with self._jobs_lock:
+            self._prune_locked()
+            return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        if self._retention_seconds > 0:
+            for job_id in list(self._jobs):
+                job = self._jobs[job_id]
+                if (
+                    job.completed_at is not None
+                    and now - job.completed_at > self._retention_seconds
+                ):
+                    del self._jobs[job_id]
+
+        overflow = len(self._jobs) - self._max_jobs
+        if overflow <= 0:
+            return
+
+        removable = sorted(
+            (
+                j for j in self._jobs.values()
+                if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+            ),
+            key=lambda j: j.created_at,
+        )
+        for job in removable[:overflow]:
+            self._jobs.pop(job.id, None)
 
     def submit(
         self,
@@ -79,25 +118,36 @@ class JobManager:
             output_path=output_path,
             register_as=register_as,
         )
-        self._jobs[job_id] = job
+        with self._jobs_lock:
+            self._jobs[job_id] = job
+            self._prune_locked()
 
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
 
         def _run() -> None:
-            job.status = JobStatus.RUNNING
+            with self._jobs_lock:
+                job.status = JobStatus.RUNNING
             try:
                 worker_fn(job)
-                job.status = JobStatus.COMPLETED
-                job.completed_at = time.time()
+                with self._jobs_lock:
+                    job.status = JobStatus.COMPLETED
+                    job.completed_at = time.time()
             except Exception as exc:
-                job.status = JobStatus.FAILED
-                job.error = str(exc)
-                job.completed_at = time.time()
+                with self._jobs_lock:
+                    job.status = JobStatus.FAILED
+                    job.error = str(exc)
+                    job.completed_at = time.time()
                 # Remove partial output so a retry doesn't hit FileExistsError
                 out = Path(job.output_path)
                 if out.exists():
                     logger.warning("Job %s failed — removing partial output: %s", job.id, out)
-                    shutil.rmtree(out, ignore_errors=True)
+                    if out.is_dir():
+                        shutil.rmtree(out, ignore_errors=True)
+                    else:
+                        out.unlink(missing_ok=True)
 
         loop.run_in_executor(self._get_executor(), _run)
         return job
