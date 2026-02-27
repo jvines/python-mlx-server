@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import numbers
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -30,6 +31,52 @@ def _check_mlx_embeddings() -> None:
             "mlx-embeddings is not installed. "
             "Run: uv add mlx-embeddings"
         )
+
+
+def _normalize_embedding_output(result: Any) -> List[List[float]]:
+    """
+    Normalize mlx_embeddings outputs to list[list[float]].
+
+    Newer mlx_embeddings returns structured dataclasses (e.g. BaseModelOutput)
+    with fields like text_embeds/pooler_output instead of a raw mx.array.
+    """
+    source = result
+    kind = "raw"
+
+    if isinstance(result, dict):
+        for key in ("text_embeds", "pooler_output", "embeddings", "last_hidden_state"):
+            if result.get(key) is not None:
+                source = result[key]
+                kind = key
+                break
+    else:
+        for attr in ("text_embeds", "pooler_output", "embeddings", "last_hidden_state"):
+            if hasattr(result, attr):
+                value = getattr(result, attr)
+                if value is not None:
+                    source = value
+                    kind = attr
+                    break
+        if kind == "raw" and isinstance(result, (list, tuple)) and result:
+            source = result[0]
+            kind = "sequence[0]"
+
+    # last_hidden_state is typically (batch, seq, hidden); mean-pool as fallback
+    if kind == "last_hidden_state" and hasattr(source, "ndim") and source.ndim == 3:
+        source = mx.mean(source, axis=1)
+
+    values = source.tolist() if hasattr(source, "tolist") else source
+    if not isinstance(values, list):
+        raise RuntimeError(f"Unexpected embedding output type: {type(values)}")
+
+    if not values:
+        return []
+
+    # Single embedding vector (1-D) -> wrap to batch shape.
+    if isinstance(values[0], numbers.Number):
+        return [values]
+
+    return values
 
 
 class EmbeddingModelManager:
@@ -97,14 +144,27 @@ class EmbeddingModelManager:
 
         model, tokenizer = await self.load_model(model_id, path)
 
-        loop = asyncio.get_running_loop()
-        embeddings: mx.array = await loop.run_in_executor(
-            _executor,
-            lambda: emb_generate(model, tokenizer, texts),
-        )
+        def _generate() -> List[List[float]]:
+            # Some tokenizers (e.g. Qwen2Tokenizer in recent transformers)
+            # don't expose batch_encode_plus; fallback to per-item embedding.
+            if isinstance(texts, list) and not hasattr(tokenizer, "batch_encode_plus"):
+                logger.info(
+                    "Tokenizer for '%s' has no batch_encode_plus; embedding batch item-by-item",
+                    model_id,
+                )
+                vectors: List[List[float]] = []
+                for text in texts:
+                    item = _normalize_embedding_output(
+                        emb_generate(model, tokenizer, text)
+                    )
+                    if not item:
+                        continue
+                    vectors.append(item[0])
+                return vectors
+            return _normalize_embedding_output(emb_generate(model, tokenizer, texts))
 
-        # mx.array → Python list of lists
-        return embeddings.tolist()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_executor, _generate)
 
 
 embedding_manager = EmbeddingModelManager()

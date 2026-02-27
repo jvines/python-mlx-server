@@ -101,8 +101,8 @@ async def create_embeddings(request: EmbeddingRequest):
             ),
         )
 
-    texts = [request.input] if isinstance(request.input, str) else request.input
-    if not texts:
+    texts = request.input
+    if isinstance(texts, list) and not texts:
         raise HTTPException(status_code=422, detail="input must not be empty")
 
     try:
@@ -115,7 +115,10 @@ async def create_embeddings(request: EmbeddingRequest):
         ) from exc
 
     # Rough token estimate — embeddings libraries don't always expose exact counts
-    total_tokens = sum(len(t.split()) for t in texts)
+    if isinstance(texts, str):
+        total_tokens = len(texts.split())
+    else:
+        total_tokens = sum(len(t.split()) for t in texts)
 
     return EmbeddingResponse(
         model=request.model,

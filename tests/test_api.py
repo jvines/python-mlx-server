@@ -262,6 +262,7 @@ class TestEmbeddings:
         assert data["object"] == "list"
         assert data["data"][0]["embedding"] == fake_vector
         assert data["data"][0]["index"] == 0
+        mock_mgr.embed.assert_awaited_once_with("embed-model", "/fake/embed", "hello world")
 
     def test_batch_input(self, client):
         entry = _entry("/fake/embed", "embedding")
@@ -281,6 +282,9 @@ class TestEmbeddings:
 
         assert response.status_code == 200
         assert len(response.json()["data"]) == 2
+        mock_mgr.embed.assert_awaited_once_with(
+            "embed-model", "/fake/embed", ["text one", "text two"]
+        )
 
     def test_base64_encoding_format_rejected(self, client):
         response = client.post(
