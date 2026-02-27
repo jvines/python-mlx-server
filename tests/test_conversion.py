@@ -7,7 +7,10 @@ these tests run without real models or network access.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -61,6 +64,36 @@ def test_job_manager_list_all_sorted():
     # Most recent first
     assert listed[0].id == j2.id
     assert listed[1].id == j1.id
+
+
+def test_job_manager_prunes_old_completed_jobs():
+    import time
+
+    mgr = JobManager(max_jobs=100, retention_seconds=1)
+
+    old = ConversionJob(
+        id="conv-old",
+        source="hf",
+        model_type="generative",
+        output_path="/tmp/old",
+        status=JobStatus.COMPLETED,
+        completed_at=time.time() - 3600,
+    )
+    fresh = ConversionJob(
+        id="conv-fresh",
+        source="hf",
+        model_type="generative",
+        output_path="/tmp/fresh",
+        status=JobStatus.COMPLETED,
+        completed_at=time.time(),
+    )
+    mgr._jobs[old.id] = old
+    mgr._jobs[fresh.id] = fresh
+
+    listed = mgr.list_all()
+    ids = [j.id for j in listed]
+    assert "conv-old" not in ids
+    assert "conv-fresh" in ids
 
 
 # ---------------------------------------------------------------------------
@@ -235,20 +268,50 @@ def test_post_hf_convert_submits_job():
     assert resp.json()["source"] == "hf"
 
 
-def test_post_gguf_convert_submits_job():
+def test_post_gguf_convert_submits_job(tmp_path: Path):
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF")
+
     job = _make_fake_job(source="gguf")
     with patch("mlx_server.api.convert.job_manager") as mock_jm:
         mock_jm.submit.return_value = job
         resp = client.post(
             "/v1/convert/gguf",
             json={
-                "gguf_path": "/Volumes/nas/model.gguf",
+                "gguf_path": str(gguf_path),
                 "hf_tokenizer_repo": "meta-llama/Llama-3.3-70B-Instruct",
                 "output_path": "/tmp/llama-mlx",
             },
         )
     assert resp.status_code == 202
     assert resp.json()["source"] == "gguf"
+
+
+def test_post_hf_convert_rejects_relative_output_path():
+    resp = client.post(
+        "/v1/convert/hf",
+        json={
+            "hf_repo": "Qwen/Qwen3-8B",
+            "output_path": "relative/out",
+            "model_type": "generative",
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_post_gguf_convert_rejects_prefer_hf_without_repo(tmp_path: Path):
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF")
+
+    resp = client.post(
+        "/v1/convert/gguf",
+        json={
+            "gguf_path": str(gguf_path),
+            "output_path": "/tmp/out",
+            "prefer_hf_tokenizer": True,
+        },
+    )
+    assert resp.status_code == 422
 
 
 def test_post_gguf_convert_rejects_non_gguf_path():
@@ -261,3 +324,143 @@ def test_post_gguf_convert_rejects_non_gguf_path():
         },
     )
     assert resp.status_code == 422
+
+
+def test_convert_from_gguf_prefers_gguf_tokenizer_by_default(tmp_path: Path):
+    """GGUF extraction is the default tokenizer source when it succeeds."""
+    from mlx_server.conversion.gguf import convert_from_gguf
+
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    out_dir = tmp_path / "out"
+    job = ConversionJob(
+        id="conv-testtok1",
+        source="gguf",
+        model_type="generative",
+        output_path=str(out_dir),
+    )
+
+    with (
+        patch("mlx_server.conversion.gguf.mx.load") as mock_load,
+        patch("mlx_server.conversion.gguf._remap_weights", return_value={}),
+        patch("mlx_server.conversion.gguf._is_already_quantized", return_value=False),
+        patch("mlx_server.conversion.gguf._build_config", return_value={"model_type": "mistral"}),
+        patch("mlx_server.conversion.gguf._save_weights"),
+        patch("mlx_server.conversion.gguf._download_tokenizer", return_value=["tokenizer.json"]) as mock_download,
+        patch("mlx_server.conversion.gguf._extract_tokenizer_from_gguf", return_value=True) as mock_extract,
+    ):
+        mock_load.return_value = ({}, {"general.architecture": "mistral"})
+        convert_from_gguf(
+            job=job,
+            gguf_path=str(gguf_path),
+            hf_tokenizer_repo="mistralai/Mistral-Nemo-Instruct-2407",
+            quantize=False,
+        )
+
+    mock_extract.assert_called_once()
+    mock_download.assert_not_called()
+
+
+def test_convert_from_gguf_force_hf_tokenizer_when_requested(tmp_path: Path):
+    """prefer_hf_tokenizer overrides GGUF extraction when a repo is provided."""
+    from mlx_server.conversion.gguf import convert_from_gguf
+
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    out_dir = tmp_path / "out"
+    job = ConversionJob(
+        id="conv-testtok2",
+        source="gguf",
+        model_type="generative",
+        output_path=str(out_dir),
+    )
+
+    with (
+        patch("mlx_server.conversion.gguf.mx.load") as mock_load,
+        patch("mlx_server.conversion.gguf._remap_weights", return_value={}),
+        patch("mlx_server.conversion.gguf._is_already_quantized", return_value=False),
+        patch("mlx_server.conversion.gguf._build_config", return_value={"model_type": "mistral"}),
+        patch("mlx_server.conversion.gguf._save_weights"),
+        patch("mlx_server.conversion.gguf._download_tokenizer") as mock_download,
+        patch("mlx_server.conversion.gguf._extract_tokenizer_from_gguf", return_value=True) as mock_extract,
+    ):
+        mock_load.return_value = ({}, {"general.architecture": "mistral"})
+        convert_from_gguf(
+            job=job,
+            gguf_path=str(gguf_path),
+            hf_tokenizer_repo="mistralai/Mistral-Nemo-Instruct-2407",
+            prefer_hf_tokenizer=True,
+            quantize=False,
+        )
+
+    mock_download.assert_called_once()
+    mock_extract.assert_not_called()
+
+
+def test_convert_from_gguf_falls_back_to_hf_when_extraction_fails(tmp_path: Path):
+    """If extraction fails and hf_tokenizer_repo is provided, fallback to HF tokenizer."""
+    from mlx_server.conversion.gguf import convert_from_gguf
+
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    out_dir = tmp_path / "out"
+    job = ConversionJob(
+        id="conv-testtok3",
+        source="gguf",
+        model_type="generative",
+        output_path=str(out_dir),
+    )
+
+    with (
+        patch("mlx_server.conversion.gguf.mx.load") as mock_load,
+        patch("mlx_server.conversion.gguf._remap_weights", return_value={}),
+        patch("mlx_server.conversion.gguf._is_already_quantized", return_value=False),
+        patch("mlx_server.conversion.gguf._build_config", return_value={"model_type": "mistral"}),
+        patch("mlx_server.conversion.gguf._save_weights"),
+        patch("mlx_server.conversion.gguf._download_tokenizer", return_value=["tokenizer.json"]) as mock_download,
+        patch("mlx_server.conversion.gguf._extract_tokenizer_from_gguf", return_value=False) as mock_extract,
+    ):
+        mock_load.return_value = ({}, {"general.architecture": "mistral"})
+        convert_from_gguf(
+            job=job,
+            gguf_path=str(gguf_path),
+            hf_tokenizer_repo="mistralai/Mistral-Nemo-Instruct-2407",
+            quantize=False,
+        )
+
+    mock_extract.assert_called_once()
+    mock_download.assert_called_once()
+
+
+def test_convert_from_gguf_raises_when_no_repo_and_extraction_fails(tmp_path: Path):
+    """RuntimeError raised when GGUF extraction fails and no hf_tokenizer_repo provided."""
+    from mlx_server.conversion.gguf import convert_from_gguf
+
+    gguf_path = tmp_path / "model.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    out_dir = tmp_path / "out"
+    job = ConversionJob(
+        id="conv-testtok4",
+        source="gguf",
+        model_type="generative",
+        output_path=str(out_dir),
+    )
+
+    with (
+        patch("mlx_server.conversion.gguf.mx.load") as mock_load,
+        patch("mlx_server.conversion.gguf._remap_weights", return_value={}),
+        patch("mlx_server.conversion.gguf._is_already_quantized", return_value=False),
+        patch("mlx_server.conversion.gguf._build_config", return_value={"model_type": "mistral"}),
+        patch("mlx_server.conversion.gguf._save_weights"),
+        patch("mlx_server.conversion.gguf._download_tokenizer") as mock_download,
+        patch("mlx_server.conversion.gguf._extract_tokenizer_from_gguf", return_value=False),
+    ):
+        mock_load.return_value = ({}, {"general.architecture": "mistral"})
+        with pytest.raises(RuntimeError, match="hf_tokenizer_repo"):
+            convert_from_gguf(
+                job=job,
+                gguf_path=str(gguf_path),
+                quantize=False,
+            )
+
+    mock_download.assert_not_called()

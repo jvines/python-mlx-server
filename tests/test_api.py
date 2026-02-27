@@ -7,6 +7,7 @@ Run with: uv run pytest tests/ -v
 
 from __future__ import annotations
 
+import time
 from typing import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,7 +20,7 @@ from mlx_server.registry import ModelEntry
 
 def _entry(path: str, type: str, **kw) -> ModelEntry:
     """Construct a ModelEntry bypassing path-existence validation (tests only)."""
-    return ModelEntry.model_construct(path=path, type=type, **kw)
+    return ModelEntry.model_construct(path=path, type=type, created=int(time.time()), **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,8 @@ def _make_fake_response(text: str, prompt_tokens: int = 10, gen_tokens: int = 5)
     r.text = text
     r.prompt_tokens = prompt_tokens
     r.generation_tokens = gen_tokens
+    r.generation_tps = 50.0
+    r.finish_reason = "stop"
     return r
 
 
@@ -80,6 +83,13 @@ class TestModelsEndpoint:
         response = client.post(
             "/v1/models/register",
             json={"id": "bad", "path": "/nonexistent/path", "type": "generative"},
+        )
+        assert response.status_code == 422
+
+    def test_register_relative_path_rejected(self, client):
+        response = client.post(
+            "/v1/models/register",
+            json={"id": "bad", "path": "relative/model", "type": "generative"},
         )
         assert response.status_code == 422
 
@@ -174,6 +184,31 @@ class TestChatCompletions:
         )
         assert response.status_code == 422
 
+    def test_temperature_zero_is_preserved(self, client):
+        entry = _entry("/fake/model", "generative")
+
+        async def fake_gen(*a, **kw):
+            assert kw["temperature"] == 0.0
+            yield _make_fake_response("ok", 5, 1)
+
+        with (
+            patch("mlx_server.api.chat.registry") as mock_reg,
+            patch("mlx_server.api.chat.generative_manager") as mock_mgr,
+        ):
+            mock_reg.get.return_value = entry
+            mock_mgr.stream = fake_gen
+
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-llm",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "temperature": 0.0,
+                    "stream": False,
+                },
+            )
+        assert response.status_code == 200
+
     def test_empty_messages_rejected(self, client):
         response = client.post(
             "/v1/chat/completions",
@@ -246,3 +281,17 @@ class TestEmbeddings:
 
         assert response.status_code == 200
         assert len(response.json()["data"]) == 2
+
+    def test_base64_encoding_format_rejected(self, client):
+        response = client.post(
+            "/v1/embeddings",
+            json={"model": "embed-model", "input": "hello", "encoding_format": "base64"},
+        )
+        assert response.status_code == 422
+
+    def test_dimensions_rejected(self, client):
+        response = client.post(
+            "/v1/embeddings",
+            json={"model": "embed-model", "input": "hello", "dimensions": 256},
+        )
+        assert response.status_code == 422
