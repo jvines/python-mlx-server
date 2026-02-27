@@ -38,19 +38,21 @@ _ARCH_MODEL_TYPE: Dict[str, str] = {
     "qwen2":    "qwen2",
     "qwen2moe": "qwen2_moe",
     "mistral":  "mistral",
-    "mistral3": "mistral",
+    "mistral3": "ministral3",
     "gemma":    "gemma",
     "gemma2":   "gemma2",
+    "granite":  "granite",
 }
 
 _ARCH_CLASS: Dict[str, str] = {
-    "llama":     "LlamaForCausalLM",
-    "qwen2":     "Qwen2ForCausalLM",
-    "qwen2_moe": "Qwen2MoeForCausalLM",
-    "mistral":   "MistralForCausalLM",
-    "mistral3":  "MistralForCausalLM",
-    "gemma":     "GemmaForCausalLM",
-    "gemma2":    "Gemma2ForCausalLM",
+    "llama":       "LlamaForCausalLM",
+    "qwen2":       "Qwen2ForCausalLM",
+    "qwen2_moe":   "Qwen2MoeForCausalLM",
+    "mistral":     "MistralForCausalLM",
+    "ministral3":  "MistralForCausalLM",
+    "gemma":       "GemmaForCausalLM",
+    "gemma2":      "Gemma2ForCausalLM",
+    "granite":     "GraniteForCausalLM",
 }
 
 # GGUF metadata key → HF config.json field
@@ -61,6 +63,7 @@ _META_MAP: List[Tuple[str, str]] = [
     ("{arch}.feed_forward_length",              "intermediate_size"),
     ("{arch}.attention.head_count",             "num_attention_heads"),
     ("{arch}.attention.head_count_kv",          "num_key_value_heads"),
+    ("{arch}.attention.key_length",             "head_dim"),
     ("{arch}.context_length",                   "max_position_embeddings"),
     ("{arch}.rope.freq_base",                   "rope_theta"),
     ("{arch}.vocab_size",                       "vocab_size"),
@@ -161,7 +164,6 @@ def _tick_progress(job: "ConversionJob", base_msg: str, interval: float = 5.0) -
         while not stop_event.wait(interval):
             elapsed = int(time.monotonic() - start)
             job.progress = f"{base_msg} ({elapsed}s elapsed)"
-            logger.info(job.progress)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -251,6 +253,55 @@ def _build_config(arch: str, meta: Dict[str, Any], weights: Dict[str, mx.array])
     elif arch in ("llama", "mistral"):
         config.setdefault("hidden_act", "silu")
         config.setdefault("tie_word_embeddings", False)
+    elif arch == "mistral3":
+        config.setdefault("hidden_act", "silu")
+        config["tie_word_embeddings"] = False
+        # ministral3.py requires rope_parameters dict (not top-level rope_theta)
+        rope_params: Dict[str, Any] = {}
+        rope_theta = config.pop("rope_theta", None)
+        if rope_theta is not None:
+            rope_params["rope_theta"] = rope_theta
+        # Try GGUF rope scaling keys (standard and variant spellings)
+        rope_type = _get("mistral3.rope.scaling.type") or _get("mistral3.rope.scale_type")
+        if rope_type:
+            rope_params["type"] = rope_type
+        rope_factor = _get("mistral3.rope.scaling.factor") or _get("mistral3.rope.scale")
+        if rope_factor is not None:
+            rope_params["factor"] = rope_factor
+        orig_ctx = (
+            _get("mistral3.rope.scaling.original_context_length")
+            or _get("mistral3.context_length")
+        )
+        if orig_ctx is not None:
+            rope_params["original_max_position_embeddings"] = int(orig_ctx)
+        beta_fast = _get("mistral3.rope.scaling.beta_fast")
+        if beta_fast is not None:
+            rope_params["beta_fast"] = beta_fast
+        beta_slow = _get("mistral3.rope.scaling.beta_slow")
+        if beta_slow is not None:
+            rope_params["beta_slow"] = beta_slow
+        temp_scale = _get("mistral3.attention.temperature_scale")
+        if temp_scale is not None:
+            rope_params["llama_4_scaling_beta"] = temp_scale
+        if rope_params:
+            config["rope_parameters"] = rope_params
+    elif arch == "granite":
+        config.setdefault("attention_bias", False)
+        config.setdefault("mlp_bias", False)
+        config.setdefault("tie_word_embeddings", False)
+        # Granite-specific scaling multipliers
+        v = _get("granite.logit_scale")
+        if v is not None:
+            config["logits_scaling"] = v
+        v = _get("granite.attention.scale")
+        if v is not None:
+            config["attention_multiplier"] = v
+        v = _get("granite.embedding_scale")
+        if v is not None:
+            config["embedding_multiplier"] = v
+        v = _get("granite.residual_scale")
+        if v is not None:
+            config["residual_multiplier"] = v
 
     return config
 
@@ -322,6 +373,33 @@ def _split_moe_experts(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
 
 def _is_already_quantized(weights: Dict[str, mx.array]) -> bool:
     return any(k.endswith(".scales") for k in weights)
+
+
+def _dequantize_lm_head(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """
+    Dequantize lm_head back to fp16 if it was quantized.
+
+    Some architectures (Mistral, Mistral3) use an unquantized nn.Linear for
+    lm_head and mlx_lm will reject lm_head.scales / lm_head.biases with
+    strict=True. Dequantizing here is safe — mlx_lm won't re-quantize it on
+    load, so there is a small memory cost for those layers at inference time.
+    """
+    if "lm_head.scales" not in weights:
+        return weights
+    w = weights["lm_head.weight"]
+    scales = weights["lm_head.scales"]
+    biases = weights["lm_head.biases"]
+    q_info = _detect_quantization({"lm_head.weight": w, "lm_head.scales": scales})
+    if q_info is None:
+        return weights
+    result = dict(weights)
+    result["lm_head.weight"] = mx.dequantize(
+        w, scales, biases, q_info["group_size"], q_info["bits"]
+    )
+    del result["lm_head.scales"]
+    del result["lm_head.biases"]
+    logger.info("gguf_remap: dequantized lm_head (architecture uses unquantized output projection)")
+    return result
 
 
 def _quantize_weights(
@@ -408,17 +486,162 @@ def _save_weights(
     )
 
 
-def _download_tokenizer(hf_repo: str, output_dir: Path) -> None:
+def _extract_tokenizer_from_gguf(metadata: Dict[str, Any], output_dir: Path) -> bool:
+    """
+    Reconstruct a HuggingFace-compatible tokenizer from GGUF metadata.
+
+    Supports BPE (tokenizer.ggml.model == "gpt2") which covers Mistral, Qwen2,
+    Llama 3, and most modern models. Returns True on success, False if the
+    tokenizer type is unsupported (caller should fall back to hf_tokenizer_repo).
+    """
+    tok_model = str(metadata.get("tokenizer.ggml.model", "")).lower()
+    tokens_raw = metadata.get("tokenizer.ggml.tokens")
+    if tokens_raw is None:
+        return False
+
+    tokens: List[str] = (
+        [str(t) for t in tokens_raw.tolist()]
+        if hasattr(tokens_raw, "tolist")
+        else [str(t) for t in tokens_raw]
+    )
+
+    merges_raw = metadata.get("tokenizer.ggml.merges")
+    has_merges = merges_raw is not None and len(merges_raw) > 0
+
+    if tok_model not in ("gpt2", "") or not has_merges:
+        logger.info("gguf_tokenizer: model type '%s' not supported for extraction", tok_model)
+        return False
+
+    merges: List[str] = (
+        [str(m) for m in merges_raw.tolist()]
+        if hasattr(merges_raw, "tolist")
+        else [str(m) for m in merges_raw]
+    )
+
+    # Token types: 0=normal, 1=byte, 3=control, 4=user_defined, 6=unused
+    token_types_raw = metadata.get("tokenizer.ggml.token_type")
+    token_types: Optional[List[int]] = None
+    if token_types_raw is not None:
+        token_types = (
+            token_types_raw.tolist()
+            if hasattr(token_types_raw, "tolist")
+            else list(token_types_raw)
+        )
+
+    def _tok_id(key: str) -> Optional[int]:
+        v = _to_python(metadata.get(key))
+        return int(v) if v is not None else None
+
+    bos_id  = _tok_id("tokenizer.ggml.bos_token_id")
+    eos_id  = _tok_id("tokenizer.ggml.eos_token_id")
+    unk_id  = _tok_id("tokenizer.ggml.unknown_token_id") or _tok_id("tokenizer.ggml.unk_token_id")
+
+    def _tok_str(tid: Optional[int]) -> Optional[str]:
+        return tokens[tid] if tid is not None and 0 <= tid < len(tokens) else None
+
+    bos_token = _tok_str(bos_id)
+    eos_token = _tok_str(eos_id)
+    unk_token = _tok_str(unk_id)
+
+    # Special tokens: control (3) or user-defined (4) type
+    SPECIAL_TYPES = {3, 4}
+    added_tokens = []
+    for i, tok in enumerate(tokens):
+        tt = token_types[i] if token_types else 0
+        if tt in SPECIAL_TYPES:
+            added_tokens.append({
+                "id": i, "content": tok, "single_word": False,
+                "lstrip": False, "rstrip": False,
+                "normalized": False, "special": True,
+            })
+
+    vocab = {tok: i for i, tok in enumerate(tokens)}
+
+    tokenizer_json = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": added_tokens,
+        "normalizer": None,
+        "pre_tokenizer": {
+            "type": "ByteLevel", "add_prefix_space": False,
+            "trim_offsets": True, "use_regex": True,
+        },
+        "post_processor": None,
+        "decoder": {
+            "type": "ByteLevel", "add_prefix_space": False,
+            "trim_offsets": True, "use_regex": True,
+        },
+        "model": {
+            "type": "BPE", "dropout": None, "unk_token": unk_token,
+            "continuing_subword_prefix": None, "end_of_word_suffix": None,
+            "fuse_unk": False, "byte_fallback": False,
+            "vocab": vocab, "merges": merges,
+        },
+    }
+    (output_dir / "tokenizer.json").write_text(
+        json.dumps(tokenizer_json, indent=2, ensure_ascii=False)
+    )
+
+    add_bos = bool(_to_python(metadata.get("tokenizer.ggml.add_bos_token", True)))
+    add_eos = bool(_to_python(metadata.get("tokenizer.ggml.add_eos_token", False)))
+    chat_template = metadata.get("tokenizer.chat_template")
+
+    tokenizer_config: Dict[str, Any] = {
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "model_max_length": 131072,
+        "bos_token": bos_token,
+        "eos_token": eos_token,
+        "unk_token": unk_token,
+        "pad_token": unk_token or eos_token,
+        "add_bos_token": add_bos,
+        "add_eos_token": add_eos,
+    }
+    if chat_template:
+        tokenizer_config["chat_template"] = str(chat_template)
+    (output_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config, indent=2))
+
+    special_tokens_map: Dict[str, Any] = {}
+    if bos_token:
+        special_tokens_map["bos_token"] = bos_token
+    if eos_token:
+        special_tokens_map["eos_token"] = eos_token
+    if unk_token:
+        special_tokens_map["unk_token"] = unk_token
+    (output_dir / "special_tokens_map.json").write_text(json.dumps(special_tokens_map, indent=2))
+
+    logger.info(
+        "gguf_tokenizer: extracted from GGUF  vocab=%d  merges=%d  special=%d",
+        len(tokens), len(merges), len(added_tokens),
+    )
+    return True
+
+
+def _download_tokenizer(hf_repo: str, output_dir: Path) -> List[str]:
     from huggingface_hub import hf_hub_download
 
+    copied: List[str] = []
     for filename in _TOKENIZER_FILES:
         try:
-            # token=False → explicit anonymous; avoids 401 from stale env tokens
             cached = hf_hub_download(repo_id=hf_repo, filename=filename, token=False)
             shutil.copy2(cached, output_dir / filename)
-            logger.info("Tokenizer file: %s", filename)
-        except Exception:
-            pass  # File absent from repo — skip silently
+            logger.info("gguf_tokenizer: %s", filename)
+            copied.append(filename)
+        except Exception as exc:
+            logger.debug(
+                "gguf_tokenizer: skipped %s from %s (%s)",
+                filename,
+                hf_repo,
+                exc,
+            )
+
+    # At least one tokenizer payload is required for mlx_lm.load(...)
+    if not any(f in copied for f in ("tokenizer.json", "tokenizer.model")):
+        raise RuntimeError(
+            f"Failed to download tokenizer payload from '{hf_repo}'. "
+            "Expected tokenizer.json or tokenizer.model."
+        )
+    return copied
 
 
 # ── Public entry point ───────────────────────────────────────────────────────
@@ -427,7 +650,8 @@ def _download_tokenizer(hf_repo: str, output_dir: Path) -> None:
 def convert_from_gguf(
     job: ConversionJob,
     gguf_path: str,
-    hf_tokenizer_repo: str,
+    hf_tokenizer_repo: Optional[str] = None,
+    prefer_hf_tokenizer: bool = False,
     quantize: bool = True,
     q_bits: int = 4,
     q_group_size: int = 64,
@@ -439,7 +663,11 @@ def convert_from_gguf(
         job:               Conversion job for progress tracking.
         gguf_path:         Absolute path to the .gguf file.
         hf_tokenizer_repo: HuggingFace repo ID to download tokenizer from
-                           (e.g. "meta-llama/Llama-3.3-70B-Instruct").
+                           (e.g. "mistralai/Ministral-3B-Instruct-2410").
+                           Optional fallback when GGUF tokenizer extraction fails.
+        prefer_hf_tokenizer:
+                           If True and hf_tokenizer_repo is set, skip GGUF
+                           tokenizer extraction and force HF tokenizer files.
         quantize:          Re-quantize fp16 weights (applies to K-quant GGUFs).
                            Q8_0 GGUFs are already quantized — this flag is ignored.
         q_bits:            Target quantisation bits (4 or 8).
@@ -493,6 +721,7 @@ def convert_from_gguf(
     logger.info("gguf_meta: num_hidden_layers        = %s", _meta("{arch}.block_count"))
     logger.info("gguf_meta: num_attention_heads      = %s", _meta("{arch}.attention.head_count"))
     logger.info("gguf_meta: num_key_value_heads      = %s", _meta("{arch}.attention.head_count_kv"))
+    logger.info("gguf_meta: head_dim                 = %s", _meta("{arch}.attention.key_length"))
     logger.info("gguf_meta: intermediate_size        = %s", _meta("{arch}.feed_forward_length"))
     logger.info("gguf_meta: max_position_embeddings  = %s", _meta("{arch}.context_length"))
     logger.info("gguf_meta: rope_theta               = %s", _meta("{arch}.rope.freq_base"))
@@ -535,11 +764,25 @@ def convert_from_gguf(
                 config.get("model_type"), config.get("vocab_size"),
                 config.get("quantization", "none"))
 
-    # ── 5. Download tokenizer ─────────────────────────────────────────────────
-    job.progress = f"Downloading tokenizer from {hf_tokenizer_repo}"
-    logger.info("gguf_tokenizer: fetching from %s", hf_tokenizer_repo)
-    _download_tokenizer(hf_tokenizer_repo, output)
-    logger.info("gguf_tokenizer: done")
+    # ── 5. Tokenizer ──────────────────────────────────────────────────────────
+    job.progress = "Preparing tokenizer"
+    if prefer_hf_tokenizer and hf_tokenizer_repo:
+        job.progress = f"Downloading tokenizer from {hf_tokenizer_repo}"
+        logger.info("gguf_tokenizer: fetching from %s", hf_tokenizer_repo)
+        copied = _download_tokenizer(hf_tokenizer_repo, output)
+        logger.info("gguf_tokenizer: downloaded %d files", len(copied))
+    elif _extract_tokenizer_from_gguf(metadata, output):
+        logger.info("gguf_tokenizer: extracted from GGUF metadata")
+    elif hf_tokenizer_repo:
+        job.progress = f"Downloading tokenizer from {hf_tokenizer_repo}"
+        logger.info("gguf_tokenizer: extraction failed; fetching from %s", hf_tokenizer_repo)
+        copied = _download_tokenizer(hf_tokenizer_repo, output)
+        logger.info("gguf_tokenizer: downloaded %d files", len(copied))
+    else:
+        raise RuntimeError(
+            "Could not extract tokenizer from GGUF metadata and no "
+            "hf_tokenizer_repo was provided. Re-submit with hf_tokenizer_repo set."
+        )
 
     # ── 6. Save weights ───────────────────────────────────────────────────────
     _save_weights(output, remapped, job)

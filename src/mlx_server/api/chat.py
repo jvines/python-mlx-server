@@ -104,6 +104,7 @@ class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    completion_tps: Optional[float] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -156,7 +157,16 @@ async def chat_completions(request: ChatCompletionRequest):
         # Accept a bare file-system path as the model field — no registration needed
         p = Path(request.model)
         if p.exists():
-            entry = ModelEntry.model_construct(path=str(p), type="generative")
+            if not p.is_absolute():
+                raise HTTPException(
+                    status_code=400,
+                    detail="When passing a model path directly, it must be absolute.",
+                )
+            entry = ModelEntry.model_construct(
+                path=str(p.resolve()),
+                type="generative",
+                created=int(time.time()),
+            )
         else:
             raise HTTPException(
                 status_code=404,
@@ -177,8 +187,8 @@ async def chat_completions(request: ChatCompletionRequest):
 
     kv_kwargs = dict(
         max_tokens=request.max_tokens,
-        temperature=request.temperature or 0.7,
-        top_p=request.top_p or 0.0,
+        temperature=0.7 if request.temperature is None else request.temperature,
+        top_p=0.0 if request.top_p is None else request.top_p,
         max_kv_size=request.max_kv_size,
         kv_bits=request.kv_bits,
         kv_group_size=request.kv_group_size,
@@ -220,11 +230,14 @@ async def _sse_stream(gen, model: str):
 
     # Closing chunk with finish_reason and optional usage
     usage_data: Dict[str, Any] = {}
+    finish_reason = "stop"
     if last_response is not None:
+        finish_reason = last_response.finish_reason or "stop"
         usage_data = {
             "prompt_tokens": last_response.prompt_tokens,
             "completion_tokens": last_response.generation_tokens,
             "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
+            "completion_tps": round(last_response.generation_tps, 2),
         }
 
     closing = {
@@ -232,7 +245,7 @@ async def _sse_stream(gen, model: str):
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
         "usage": usage_data,
     }
     yield f"data: {json.dumps(closing)}\n\n"
@@ -248,6 +261,8 @@ async def _blocking_response(gen, model: str) -> ChatCompletionResponse:
 
     prompt_tokens = last_response.prompt_tokens if last_response else 0
     completion_tokens = last_response.generation_tokens if last_response else 0
+    finish_reason = (last_response.finish_reason or "stop") if last_response else "stop"
+    completion_tps = round(last_response.generation_tps, 2) if last_response else None
 
     return ChatCompletionResponse(
         model=model,
@@ -255,12 +270,13 @@ async def _blocking_response(gen, model: str) -> ChatCompletionResponse:
             ChatChoice(
                 index=0,
                 message={"role": "assistant", "content": full_text},
-                finish_reason="stop",
+                finish_reason=finish_reason,
             )
         ],
         usage=Usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            completion_tps=completion_tps,
         ),
     )

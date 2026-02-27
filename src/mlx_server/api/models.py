@@ -14,12 +14,11 @@ Extensions:
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from ..managers import embedding_manager, generative_manager, vlm_manager
 from ..registry import ModelType, registry
@@ -52,9 +51,30 @@ class RegisterRequest(BaseModel):
     @field_validator("path")
     @classmethod
     def path_exists(cls, v: str) -> str:
-        if not Path(v).exists():
+        p = Path(v)
+        if not p.is_absolute():
+            raise ValueError("path must be absolute")
+        if not p.exists():
             raise ValueError(f"Path does not exist: {v}")
-        return v
+        return str(p.resolve())
+
+    @field_validator("mmproj")
+    @classmethod
+    def mmproj_exists_if_set(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        p = Path(v)
+        if not p.is_absolute():
+            raise ValueError("mmproj must be an absolute path")
+        if not p.exists():
+            raise ValueError(f"mmproj path does not exist: {v}")
+        return str(p.resolve())
+
+    @model_validator(mode="after")
+    def validate_mmproj_for_model_type(self) -> "RegisterRequest":
+        if self.mmproj is not None and self.type != "vlm":
+            raise ValueError("mmproj is only valid for models with type='vlm'")
+        return self
 
 
 class ModelListResponse(BaseModel):
@@ -79,7 +99,7 @@ def _to_model_object(model_id: str, loaded_set: set) -> ModelObject:
     entry = registry.get(model_id)
     return ModelObject(
         id=model_id,
-        created=int(time.time()),
+        created=entry.created,
         type=entry.type,
         loaded=model_id in loaded_set,
         path=entry.path,

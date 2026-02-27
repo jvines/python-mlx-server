@@ -6,6 +6,8 @@ OpenAI-compatible embeddings endpoint backed by mlx_embeddings.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import List, Literal, Optional, Union
 
 from fastapi import APIRouter, HTTPException
@@ -17,6 +19,7 @@ from ..managers import embedding_manager
 from ..registry import registry, ModelEntry
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -56,11 +59,31 @@ class EmbeddingResponse(BaseModel):
 
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(request: EmbeddingRequest):
+    if request.encoding_format != "float":
+        raise HTTPException(
+            status_code=422,
+            detail="Only encoding_format='float' is currently supported.",
+        )
+    if request.dimensions is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="dimensions is not currently supported by mlx_embeddings.",
+        )
+
     entry = registry.get(request.model)
     if entry is None:
         p = Path(request.model)
         if p.exists():
-            entry = ModelEntry.model_construct(path=str(p), type="embedding")
+            if not p.is_absolute():
+                raise HTTPException(
+                    status_code=400,
+                    detail="When passing a model path directly, it must be absolute.",
+                )
+            entry = ModelEntry.model_construct(
+                path=str(p.resolve()),
+                type="embedding",
+                created=int(time.time()),
+            )
         else:
             raise HTTPException(
                 status_code=404,
@@ -85,7 +108,11 @@ async def create_embeddings(request: EmbeddingRequest):
     try:
         vectors = await embedding_manager.embed(request.model, entry.path, texts)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception("Embedding generation failed for model '%s'", request.model)
+        raise HTTPException(
+            status_code=500,
+            detail="Embedding generation failed. Check server logs for details.",
+        ) from exc
 
     # Rough token estimate — embeddings libraries don't always expose exact counts
     total_tokens = sum(len(t.split()) for t in texts)

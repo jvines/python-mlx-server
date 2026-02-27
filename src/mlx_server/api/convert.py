@@ -17,7 +17,9 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from pathlib import Path
 
 from ..conversion import job_manager, JobStatus
 from ..conversion.hf import convert_from_hf
@@ -45,14 +47,30 @@ class HFConvertRequest(BaseModel):
         description="If set, register the converted model under this ID after completion",
     )
 
+    @field_validator("output_path")
+    @classmethod
+    def output_path_must_be_absolute(cls, v: str) -> str:
+        p = Path(v)
+        if not p.is_absolute():
+            raise ValueError("output_path must be an absolute path")
+        return str(p)
+
 
 class GGUFConvertRequest(BaseModel):
     gguf_path: str = Field(..., description="Absolute path to the local .gguf file")
-    hf_tokenizer_repo: str = Field(
-        ...,
+    hf_tokenizer_repo: Optional[str] = Field(
+        default=None,
         description=(
-            "HuggingFace repo ID used to download the tokenizer "
-            "(e.g. 'meta-llama/Llama-3.3-70B-Instruct')"
+            "HuggingFace repo ID used to download the tokenizer. "
+            "Used as a fallback when GGUF tokenizer extraction fails. "
+            "Required for sentencepiece models (Llama 2)."
+        ),
+    )
+    prefer_hf_tokenizer: bool = Field(
+        default=False,
+        description=(
+            "If true and hf_tokenizer_repo is provided, skip GGUF tokenizer extraction "
+            "and force HF tokenizer files."
         ),
     )
     output_path: str = Field(..., description="Absolute local path for the converted model")
@@ -67,10 +85,29 @@ class GGUFConvertRequest(BaseModel):
 
     @field_validator("gguf_path")
     @classmethod
-    def path_must_end_with_gguf(cls, v: str) -> str:
-        if not v.lower().endswith(".gguf"):
+    def path_must_be_absolute_existing_gguf(cls, v: str) -> str:
+        p = Path(v)
+        if not p.is_absolute():
+            raise ValueError("gguf_path must be an absolute path")
+        if not p.exists() or not p.is_file():
+            raise ValueError(f"gguf_path does not exist: {v}")
+        if not p.name.lower().endswith(".gguf"):
             raise ValueError("gguf_path must end with .gguf")
-        return v
+        return str(p.resolve())
+
+    @field_validator("output_path")
+    @classmethod
+    def output_path_must_be_absolute(cls, v: str) -> str:
+        p = Path(v)
+        if not p.is_absolute():
+            raise ValueError("output_path must be an absolute path")
+        return str(p)
+
+    @model_validator(mode="after")
+    def require_hf_repo_when_forced(self) -> "GGUFConvertRequest":
+        if self.prefer_hf_tokenizer and not self.hf_tokenizer_repo:
+            raise ValueError("hf_tokenizer_repo is required when prefer_hf_tokenizer=true")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +133,48 @@ def _job_response(job) -> dict:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+
+class HFDownloadRequest(BaseModel):
+    hf_repo: str = Field(..., description="HuggingFace repo ID of a pre-converted MLX model")
+    output_path: str = Field(..., description="Absolute local path to download into")
+    model_type: Literal["generative", "embedding", "vlm"] = "generative"
+    register_as: Optional[str] = Field(
+        default=None,
+        description="If set, register the model under this ID after download",
+    )
+
+    @field_validator("output_path")
+    @classmethod
+    def output_path_must_be_absolute(cls, v: str) -> str:
+        p = Path(v)
+        if not p.is_absolute():
+            raise ValueError("output_path must be an absolute path")
+        return str(p)
+
+
+@router.post("/download", status_code=202)
+async def download_from_hf_endpoint(request: HFDownloadRequest):
+    """Download a pre-converted MLX model from HuggingFace as-is."""
+    from huggingface_hub import snapshot_download
+
+    def worker(job):
+        output = Path(job.output_path)
+        if output.exists():
+            raise FileExistsError(f"Output path already exists: {output}")
+        job.progress = f"Downloading {request.hf_repo}"
+        snapshot_download(repo_id=request.hf_repo, local_dir=str(output))
+        if job.register_as:
+            registry.register(job.register_as, job.output_path, job.model_type, overwrite=True)
+
+    job = job_manager.submit(
+        source="download",
+        model_type=request.model_type,
+        output_path=request.output_path,
+        worker_fn=worker,
+        register_as=request.register_as,
+    )
+    return _job_response(job)
 
 
 @router.post("/hf", status_code=202)
@@ -133,6 +212,7 @@ async def convert_from_gguf_endpoint(request: GGUFConvertRequest):
             job=job,
             gguf_path=request.gguf_path,
             hf_tokenizer_repo=request.hf_tokenizer_repo,
+            prefer_hf_tokenizer=request.prefer_hf_tokenizer,
             quantize=request.quantize,
             q_bits=request.q_bits,
             q_group_size=request.q_group_size,
