@@ -13,17 +13,13 @@ Tests mock all model loading — you can run them without any MLX models install
 
 ```bash
 uv run mlx-server
-# Interactive API docs at http://localhost:8080/docs
+# Interactive API docs at http://localhost:1234/docs
 ```
 
 ## Testing against real models
 
-```bash
-uv run mlx-server &
-uv run python smoke_test.py --test inference   # downloads SmolLM2-135M (~270 MB)
-uv run python smoke_test.py --test hf          # converts SmolLM2-135M to 4-bit
-uv run python smoke_test.py --test gguf        # converts a local GGUF (edit path in smoke_test.py)
-```
+Use the API examples in `README.md` (register, chat, embeddings, conversion)
+against a running local server.
 
 ## Code structure
 

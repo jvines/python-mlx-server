@@ -10,7 +10,7 @@ Designed for running multiple local models side-by-side without multiple llama.c
 - **Lazy loading + TTL eviction** — models stay resident between requests, freed after idle timeout
 - **KV cache controls** — `max_kv_size`, `kv_bits`, `kv_group_size` exposed per-request (fixes OOM on Qwen3.5)
 - **Three backends** — generative (`mlx-lm`), embeddings (`mlx-embeddings`), vision-language (`mlx-vlm`)
-- **Conversion endpoint** — convert HuggingFace repos or local GGUFs to MLX format via async jobs
+- **Conversion endpoints** — convert HF repos/GGUFs or download pre-converted MLX repos
 - **OpenAI-compatible** — `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`
 - **Streaming SSE** — `"stream": true` returns Server-Sent Events
 
@@ -131,6 +131,8 @@ curl -N -X POST http://localhost:1234/v1/chat/completions \
   -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"Hi"}],"stream":true}'
 ```
 
+Responses include `usage.completion_tps` (tokens/sec) when available from the backend.
+
 **Fixing Qwen3.5 KV OOM:**
 ```json
 {
@@ -173,14 +175,31 @@ POST /v1/convert/hf
 POST /v1/convert/gguf
 {
   "gguf_path": "/path/to/model.gguf",
-  "hf_tokenizer_repo": "meta-llama/Llama-3.3-70B-Instruct",
   "output_path": "/path/to/output",
+  "hf_tokenizer_repo": "mistralai/Mistral-Nemo-Instruct-2407",  # optional fallback
+  "prefer_hf_tokenizer": false, # optional: true to force HF tokenizer over GGUF extraction
   "quantize": false,           # false for Q8_0 (already MLX-native); true for K-quants
   "register_as": "llama-70b"
 }
 ```
 
-Supported GGUF architectures: `llama`, `qwen2`, `qwen2moe`, `mistral`, `mistral3`, `gemma`, `gemma2`
+Tokenizer behavior:
+- default: extract tokenizer from GGUF metadata (offline-first)
+- fallback: if extraction fails and `hf_tokenizer_repo` is set, download tokenizer files
+- override: set `prefer_hf_tokenizer=true` to force HF tokenizer files
+
+Supported GGUF architectures: `llama`, `qwen2`, `qwen2moe`, `mistral`, `mistral3`, `gemma`, `gemma2`, `granite`
+
+**Download a pre-converted MLX repo from HuggingFace:**
+```bash
+POST /v1/convert/download
+{
+  "hf_repo": "mlx-community/Qwen3-8B-4bit-DWQ",
+  "output_path": "/path/to/output",
+  "model_type": "generative",
+  "register_as": "qwen3-8b-mlx"
+}
+```
 
 > **Note on K-quant GGUFs (Q4_K_M, Q5_K_S, etc.):** `mx.load` dequantizes these to float16.
 > A 70B K-quant model requires ~140 GB intermediate RAM — use the HF path for 70B models.
@@ -215,12 +234,6 @@ Register with `"type": "vlm"` and include image URLs in the message content:
 ```bash
 uv sync
 uv run pytest tests/ -v
-
-# Smoke test against a live server
-uv run mlx-server &
-uv run python smoke_test.py --test inference
-uv run python smoke_test.py --test hf
-uv run python smoke_test.py --test gguf
 ```
 
 ## Project structure
@@ -246,5 +259,4 @@ src/mlx_server/
 tests/
 ├── test_api.py        # API + manager tests (mocked, no models needed)
 └── test_conversion.py # Conversion job + weight remapping tests
-smoke_test.py          # End-to-end tests against a live server
 ```
