@@ -12,7 +12,7 @@ import logging
 import numbers
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import mlx.core as mx
 
@@ -84,6 +84,9 @@ class EmbeddingModelManager:
         self._models: Dict[str, Tuple[Any, Any]] = {}  # id → (model, tokenizer)
         self._locks: Dict[str, asyncio.Lock] = {}
         self._last_used: Dict[str, float] = {}
+        # In-flight embedding calls per model; eviction/unload never frees a
+        # model that is mid-use. Mutated only on the event loop.
+        self._in_use: Dict[str, int] = {}
 
     def _lock(self, model_id: str) -> asyncio.Lock:
         if model_id not in self._locks:
@@ -106,11 +109,18 @@ class EmbeddingModelManager:
         self._last_used[model_id] = time.monotonic()
         return self._models[model_id]
 
-    def unload(self, model_id: str) -> bool:
+    def unload(self, model_id: str, force: bool = False) -> bool:
         if model_id not in self._models:
+            return False
+        if not force and self._in_use.get(model_id, 0) > 0:
+            logger.info(
+                "Not unloading embedding model '%s': %d call(s) in flight",
+                model_id, self._in_use[model_id],
+            )
             return False
         del self._models[model_id]
         self._last_used.pop(model_id, None)
+        self._locks.pop(model_id, None)
         mx.metal.clear_cache()
         logger.info(f"Unloaded embedding model '{model_id}'")
         return True
@@ -119,14 +129,16 @@ class EmbeddingModelManager:
         return list(self._models.keys())
 
     def evict_stale(self, ttl: int) -> List[str]:
-        """Unload models idle for longer than ttl seconds. Returns evicted IDs."""
+        """Unload models idle for longer than ttl seconds. Returns evicted IDs.
+
+        Models with an in-flight embedding call are never evicted.
+        """
         now = time.monotonic()
-        evicted = [
-            mid for mid, last in list(self._last_used.items())
-            if now - last > ttl
-        ]
-        for mid in evicted:
-            self.unload(mid)
+        evicted = []
+        for mid, last in list(self._last_used.items()):
+            if now - last > ttl and self._in_use.get(mid, 0) == 0:
+                if self.unload(mid):
+                    evicted.append(mid)
         return evicted
 
     async def embed(
@@ -163,8 +175,13 @@ class EmbeddingModelManager:
                 return vectors
             return _normalize_embedding_output(emb_generate(model, tokenizer, texts))
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_executor, _generate)
+        self._in_use[model_id] = self._in_use.get(model_id, 0) + 1
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(_executor, _generate)
+        finally:
+            self._in_use[model_id] = max(0, self._in_use.get(model_id, 1) - 1)
+            self._last_used[model_id] = time.monotonic()
 
 
 embedding_manager = EmbeddingModelManager()
