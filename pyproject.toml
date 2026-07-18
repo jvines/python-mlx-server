@@ -1,6 +1,6 @@
 [project]
 name = "python-mlx-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "A lightweight OpenAI-compatible API server for running MLX models on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,6 +35,7 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 filterwarnings = [
     "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
     "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
