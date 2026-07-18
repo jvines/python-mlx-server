@@ -6,17 +6,16 @@ OpenAI-compatible embeddings endpoint backed by mlx_embeddings.
 
 from __future__ import annotations
 
+import base64
 import logging
-import time
 from typing import List, Literal, Optional, Union
 
+import numpy as np
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-
-from pathlib import Path
+from pydantic import BaseModel, field_validator
 
 from ..managers import embedding_manager
-from ..registry import registry, ModelEntry
+from .deps import resolve_model_entry
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -33,10 +32,22 @@ class EmbeddingRequest(BaseModel):
     encoding_format: Literal["float", "base64"] = "float"
     dimensions: Optional[int] = None  # accepted but not enforced (model-determined)
 
+    @field_validator("input")
+    @classmethod
+    def _input_within_limits(cls, v: Union[str, List[str]]) -> Union[str, List[str]]:
+        items = [v] if isinstance(v, str) else v
+        if len(items) > 2048:
+            raise ValueError("input has too many items (max 2048)")
+        if sum(len(s) for s in items) > 2_000_000:
+            raise ValueError("input is too large (max 2,000,000 characters total)")
+        return v
+
 
 class EmbeddingObject(BaseModel):
     object: str = "embedding"
-    embedding: List[float]
+    # A vector of floats, or its base64-encoded little-endian float32 form when
+    # encoding_format="base64" (matches the OpenAI response contract).
+    embedding: Union[List[float], str]
     index: int
 
 
@@ -53,45 +64,36 @@ class EmbeddingResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _encode_base64(vec: List[float]) -> str:
+    """OpenAI-compatible base64 encoding: little-endian float32 bytes, base64."""
+    arr = np.asarray(vec, dtype="<f4")
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+# ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
 
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(request: EmbeddingRequest):
-    if request.encoding_format != "float":
-        raise HTTPException(
-            status_code=422,
-            detail="Only encoding_format='float' is currently supported.",
-        )
+    input_count = 1 if isinstance(request.input, str) else len(request.input)
+    logger.info(
+        "embeddings_request model=%s inputs=%d encoding_format=%s",
+        request.model, input_count, request.encoding_format,
+    )
+
     if request.dimensions is not None:
-        raise HTTPException(
-            status_code=422,
-            detail="dimensions is not currently supported by mlx_embeddings.",
+        logger.info(
+            "dimensions=%s requested but not enforced (model-determined)",
+            request.dimensions,
         )
 
-    entry = registry.get(request.model)
-    if entry is None:
-        p = Path(request.model)
-        if p.exists():
-            if not p.is_absolute():
-                raise HTTPException(
-                    status_code=400,
-                    detail="When passing a model path directly, it must be absolute.",
-                )
-            entry = ModelEntry.model_construct(
-                path=str(p.resolve()),
-                type="embedding",
-                created=int(time.time()),
-            )
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Model '{request.model}' is not registered and the path does not exist. "
-                    "Register it with POST /v1/models/register or pass an absolute path."
-                ),
-            )
+    entry = resolve_model_entry(request.model, "embedding")
     if entry.type != "embedding":
         raise HTTPException(
             status_code=400,
@@ -120,11 +122,19 @@ async def create_embeddings(request: EmbeddingRequest):
     else:
         total_tokens = sum(len(t.split()) for t in texts)
 
-    return EmbeddingResponse(
-        model=request.model,
-        data=[
+    if request.encoding_format == "base64":
+        data = [
+            EmbeddingObject(embedding=_encode_base64(vec), index=i)
+            for i, vec in enumerate(vectors)
+        ]
+    else:
+        data = [
             EmbeddingObject(embedding=vec, index=i)
             for i, vec in enumerate(vectors)
-        ],
+        ]
+
+    return EmbeddingResponse(
+        model=request.model,
+        data=data,
         usage=EmbeddingUsage(prompt_tokens=total_tokens, total_tokens=total_tokens),
     )

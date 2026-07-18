@@ -11,6 +11,7 @@ Supports:
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -19,12 +20,11 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-from pathlib import Path
-
 from ..managers import generative_manager, vlm_manager
-from ..registry import registry, ModelEntry
+from .deps import resolve_model_entry
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -75,12 +75,18 @@ class ChatCompletionRequest(BaseModel):
     # Sampling
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    max_tokens: Optional[int] = Field(default=512, ge=1)
+    max_tokens: Optional[int] = Field(default=512, ge=1, le=131072)
     stream: Optional[bool] = False
+    # Number of completions. Only n=1 is supported; other values are rejected
+    # rather than silently ignored.
+    n: Optional[int] = Field(default=1, ge=1)
+    # Qwen3.5-compatible explicit thinking control.
+    # If None, tokenizer/model default behavior is used.
+    enable_thinking: Optional[bool] = None
 
     # KV cache controls — exposed to fix OOM on long-context / new architectures
     # max_kv_size: cap the KV cache to N tokens (circular buffer, old tokens evicted)
-    max_kv_size: Optional[int] = Field(default=None, ge=64)
+    max_kv_size: Optional[int] = Field(default=None, ge=64, le=1_048_576)
     # kv_bits: quantise the KV cache (4 or 8). Reduces KV memory 2-4x.
     kv_bits: Optional[Literal[4, 8]] = None
     kv_group_size: int = Field(default=64, ge=1)
@@ -152,29 +158,21 @@ def _collect_images(messages: List[Message]) -> List[str]:
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
-    entry = registry.get(request.model)
-    if entry is None:
-        # Accept a bare file-system path as the model field — no registration needed
-        p = Path(request.model)
-        if p.exists():
-            if not p.is_absolute():
-                raise HTTPException(
-                    status_code=400,
-                    detail="When passing a model path directly, it must be absolute.",
-                )
-            entry = ModelEntry.model_construct(
-                path=str(p.resolve()),
-                type="generative",
-                created=int(time.time()),
-            )
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Model '{request.model}' is not registered and the path does not exist. "
-                    "Register it with POST /v1/models/register or pass an absolute path."
-                ),
-            )
+    logger.info(
+        "chat_request model=%s stream=%s messages=%d max_tokens=%s enable_thinking=%s",
+        request.model,
+        bool(request.stream),
+        len(request.messages),
+        request.max_tokens,
+        request.enable_thinking,
+    )
+    if request.n is not None and request.n != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Only n=1 is supported.",
+        )
+
+    entry = resolve_model_entry(request.model, "generative")
     if entry.type == "embedding":
         raise HTTPException(
             status_code=400,
@@ -196,72 +194,142 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
     if entry.type == "vlm":
+        if request.enable_thinking is not None:
+            logger.info("enable_thinking is not supported for VLM models; ignoring")
         images = _collect_images(request.messages)
+        # VLMModelManager.stream has no top_p parameter (mlx_vlm samples on
+        # temperature only). Drop it here instead of splatting it in and
+        # raising TypeError on every VLM request.
+        vlm_kwargs = {k: v for k, v in kv_kwargs.items() if k != "top_p"}
         gen = vlm_manager.stream(
-            request.model, entry.path, messages_dicts, images=images or None, **kv_kwargs
+            request.model, entry.path, messages_dicts, images=images or None, **vlm_kwargs
         )
     else:
         gen = generative_manager.stream(
-            request.model, entry.path, messages_dicts, **kv_kwargs
+            request.model,
+            entry.path,
+            messages_dicts,
+            enable_thinking=request.enable_thinking,
+            **kv_kwargs,
         )
 
     if request.stream:
-        return StreamingResponse(
-            _sse_stream(gen, request.model),
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no"},
-        )
+        return await _streaming_response(gen, request.model)
 
-    return await _blocking_response(gen, request.model)
+    try:
+        return await _blocking_response(gen, request.model)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Generation failed for model '%s'", request.model)
+        raise HTTPException(
+            status_code=500,
+            detail="Generation failed. Check server logs for details.",
+        ) from exc
 
 
-async def _sse_stream(gen, model: str):
+async def _streaming_response(gen, model: str) -> StreamingResponse:
+    """Prime the generator so load/setup errors surface as a normal HTTP error
+    (before streaming headers are committed), then stream the rest as SSE."""
+    agen = gen.__aiter__()
+    try:
+        first = await agen.__anext__()
+    except StopAsyncIteration:
+        first = None
+    except Exception as exc:
+        logger.exception("Generation failed before streaming for model '%s'", model)
+        raise HTTPException(
+            status_code=503,
+            detail="Generation failed to start. Check server logs for details.",
+        ) from exc
+    return StreamingResponse(
+        _sse_stream(agen, first, model),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no"},
+    )
+
+
+async def _sse_stream(agen, first, model: str):
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created = int(time.time())
 
     # Opening chunk — signals role to the client
     yield _make_chunk(chunk_id, model, created, {"role": "assistant", "content": ""})
 
-    last_response = None
-    async for response in gen:
-        last_response = response
-        if response.text:
-            yield _make_chunk(chunk_id, model, created, {"content": response.text})
+    last_response = first
+    try:
+        try:
+            if first is not None and first.text:
+                yield _make_chunk(chunk_id, model, created, {"content": first.text})
+            async for response in agen:
+                last_response = response
+                if response.text:
+                    yield _make_chunk(chunk_id, model, created, {"content": response.text})
+        except Exception:
+            # Failure after headers were already committed: the status code is
+            # fixed at 200, so emit an OpenAI-style error event and terminate the
+            # stream cleanly instead of leaving the client on a truncated body.
+            logger.exception("Streaming generation failed mid-stream for model '%s'", model)
+            err = {
+                "error": {
+                    "message": "Generation failed mid-stream. Check server logs for details.",
+                    "type": "server_error",
+                }
+            }
+            yield f"data: {json.dumps(err)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
-    # Closing chunk with finish_reason and optional usage
-    usage_data: Dict[str, Any] = {}
-    finish_reason = "stop"
-    if last_response is not None:
-        finish_reason = last_response.finish_reason or "stop"
-        usage_data = {
-            "prompt_tokens": last_response.prompt_tokens,
-            "completion_tokens": last_response.generation_tokens,
-            "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
-            "completion_tps": round(last_response.generation_tps, 2),
+        # Closing chunk with finish_reason and optional usage
+        usage_data: Dict[str, Any] = {}
+        finish_reason = "stop"
+        if last_response is not None:
+            # mlx_vlm's GenerationResult has no finish_reason attribute (mlx_lm's
+            # GenerationResponse does); read it defensively so both backends work.
+            finish_reason = getattr(last_response, "finish_reason", None) or "stop"
+            usage_data = {
+                "prompt_tokens": last_response.prompt_tokens,
+                "completion_tokens": last_response.generation_tokens,
+                "total_tokens": last_response.prompt_tokens + last_response.generation_tokens,
+                "completion_tps": round(last_response.generation_tps, 2),
+            }
+
+        closing = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "usage": usage_data,
         }
-
-    closing = {
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-        "usage": usage_data,
-    }
-    yield f"data: {json.dumps(closing)}\n\n"
-    yield "data: [DONE]\n\n"
+        yield f"data: {json.dumps(closing)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        # Deterministically tear down the generator chain (bridge worker +
+        # in-use counter) even on client disconnect: async-for does not aclose
+        # its iterator on GeneratorExit, so without this the bridge worker could
+        # be left running and the in-use count leaked until GC.
+        await agen.aclose()
 
 
 async def _blocking_response(gen, model: str) -> ChatCompletionResponse:
     full_text = ""
     last_response = None
-    async for response in gen:
-        full_text += response.text
-        last_response = response
+    agen = gen.__aiter__()
+    try:
+        async for response in agen:
+            full_text += response.text
+            last_response = response
+    finally:
+        # Ensure the bridge worker + in-use counter are torn down even if the
+        # request is cancelled mid-generation (client disconnect).
+        await agen.aclose()
 
     prompt_tokens = last_response.prompt_tokens if last_response else 0
     completion_tokens = last_response.generation_tokens if last_response else 0
-    finish_reason = (last_response.finish_reason or "stop") if last_response else "stop"
+    finish_reason = (
+        (getattr(last_response, "finish_reason", None) or "stop") if last_response else "stop"
+    )
     completion_tps = round(last_response.generation_tps, 2) if last_response else None
 
     return ChatCompletionResponse(

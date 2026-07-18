@@ -53,7 +53,10 @@ class HFConvertRequest(BaseModel):
         p = Path(v)
         if not p.is_absolute():
             raise ValueError("output_path must be an absolute path")
-        return str(p)
+        # Normalise (collapse '..' and symlinks) but do NOT confine to a fixed
+        # root: models are intentionally converted to varied locations (local
+        # cache, external volumes, etc.).
+        return str(p.resolve())
 
 
 class GGUFConvertRequest(BaseModel):
@@ -101,7 +104,10 @@ class GGUFConvertRequest(BaseModel):
         p = Path(v)
         if not p.is_absolute():
             raise ValueError("output_path must be an absolute path")
-        return str(p)
+        # Normalise (collapse '..' and symlinks) but do NOT confine to a fixed
+        # root: models are intentionally converted to varied locations (local
+        # cache, external volumes, etc.).
+        return str(p.resolve())
 
     @model_validator(mode="after")
     def require_hf_repo_when_forced(self) -> "GGUFConvertRequest":
@@ -150,7 +156,10 @@ class HFDownloadRequest(BaseModel):
         p = Path(v)
         if not p.is_absolute():
             raise ValueError("output_path must be an absolute path")
-        return str(p)
+        # Normalise (collapse '..' and symlinks) but do NOT confine to a fixed
+        # root: models are intentionally converted to varied locations (local
+        # cache, external volumes, etc.).
+        return str(p.resolve())
 
 
 @router.post("/download", status_code=202)
