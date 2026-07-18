@@ -464,3 +464,194 @@ def test_convert_from_gguf_raises_when_no_repo_and_extraction_fails(tmp_path: Pa
             )
 
     mock_download.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Failure-cleanup safety (regression: arbitrary directory deletion / data loss)
+# ---------------------------------------------------------------------------
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> None:
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition not met within timeout")
+
+
+def test_failed_job_does_not_delete_preexisting_output(tmp_path: Path):
+    """A job that fails because its output path already existed must NOT delete
+    that pre-existing directory (the worker never created it)."""
+    mgr = JobManager()
+    precious = tmp_path / "precious"
+    precious.mkdir()
+    (precious / "keep.txt").write_text("do not delete")
+
+    def failing_worker(job: ConversionJob):
+        # Mirrors the real workers, which refuse to overwrite an existing path.
+        if Path(job.output_path).exists():
+            raise FileExistsError(f"Output path already exists: {job.output_path}")
+
+    job = mgr.submit("hf", "generative", str(precious), failing_worker)
+    _wait_for(lambda: job.status == JobStatus.FAILED)
+
+    assert precious.exists()
+    assert (precious / "keep.txt").read_text() == "do not delete"
+    assert job.error and "FileExistsError" in job.error
+
+
+def test_failed_job_removes_partial_output_it_created(tmp_path: Path):
+    """A job that DID create its output dir and then failed must clean up the
+    partial output so a retry isn't blocked."""
+    mgr = JobManager()
+    out = tmp_path / "newout"
+
+    def failing_worker(job: ConversionJob):
+        d = Path(job.output_path)
+        d.mkdir()
+        (d / "partial.bin").write_text("x")
+        raise RuntimeError("boom")
+
+    job = mgr.submit("gguf", "generative", str(out), failing_worker)
+    _wait_for(lambda: job.status == JobStatus.FAILED)
+
+    assert not out.exists()
+    assert job.error and "RuntimeError" in job.error
+
+
+# ---------------------------------------------------------------------------
+# Quantization detection (regression: 4-bit misdetected as 8-bit)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_quantization_is_shape_ambiguous_without_hint():
+    """A genuine 4-bit / group_size=64 layer has the same tensor shapes as an
+    8-bit / group_size=32 layer; shape inference alone picks 8-bit. This is
+    why the converter must thread the known bit width through."""
+    import mlx.core as mx
+    from mlx_server.conversion.gguf import _detect_quantization
+
+    q, scales, _biases = mx.quantize(mx.zeros((256, 512)), group_size=64, bits=4)
+    weights = {"layer.weight": q, "layer.scales": scales}
+
+    assert _detect_quantization(weights) == {"bits": 8, "group_size": 32}
+    assert _detect_quantization(weights, known_bits=4) == {"bits": 4, "group_size": 64}
+
+
+def test_build_config_prefers_quant_override():
+    """_build_config must trust the params actually applied over re-inferring
+    from shapes."""
+    import mlx.core as mx
+    from mlx_server.conversion.gguf import _build_config
+
+    meta = {"general.architecture": "llama", "llama.embedding_length": 512}
+    q, scales, _biases = mx.quantize(mx.zeros((256, 512)), group_size=64, bits=4)
+    weights = {
+        "model.embed_tokens.weight": mx.zeros((32000, 512)),
+        "layer.weight": q,
+        "layer.scales": scales,
+    }
+
+    # Without an override, detection would write the wrong 8-bit block.
+    assert _build_config("llama", meta, weights)["quantization"] == {"bits": 8, "group_size": 32}
+    # With the override, config reflects what was really applied.
+    cfg = _build_config("llama", meta, weights, quant_override={"bits": 4, "group_size": 64})
+    assert cfg["quantization"] == {"bits": 4, "group_size": 64}
+
+
+def test_gguf_file_type_bits_mapping():
+    from mlx_server.conversion.gguf import _gguf_file_type_bits
+
+    assert _gguf_file_type_bits({"general.file_type": 2}) == 4   # Q4_0
+    assert _gguf_file_type_bits({"general.file_type": 3}) == 4   # Q4_1
+    assert _gguf_file_type_bits({"general.file_type": 7}) == 8   # Q8_0
+    # Q5_0 (8) / Q5_1 (9) are dequantized by MLX on load -> not in the map.
+    assert _gguf_file_type_bits({"general.file_type": 8}) is None
+    assert _gguf_file_type_bits({"general.file_type": 9}) is None
+    assert _gguf_file_type_bits({"general.file_type": 15}) is None  # a K-quant
+    assert _gguf_file_type_bits({}) is None
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace conversion routing
+# ---------------------------------------------------------------------------
+
+
+def test_convert_from_hf_routes_generative_backend(tmp_path: Path):
+    from mlx_server.conversion.hf import convert_from_hf
+
+    out = tmp_path / "out"
+    job = ConversionJob(id="c-hf1", source="hf", model_type="generative", output_path=str(out))
+    with patch("mlx_lm.convert.convert") as mock_convert:
+        convert_from_hf(job=job, hf_repo="org/model", q_bits=4, q_group_size=64)
+
+    mock_convert.assert_called_once()
+    kwargs = mock_convert.call_args.kwargs
+    assert kwargs["hf_path"] == "org/model"
+    assert kwargs["mlx_path"] == str(out)
+    assert kwargs["q_bits"] == 4
+
+
+def test_convert_from_hf_raises_if_output_exists(tmp_path: Path):
+    from mlx_server.conversion.hf import convert_from_hf
+
+    out = tmp_path / "existing"
+    out.mkdir()
+    job = ConversionJob(id="c-hf2", source="hf", model_type="generative", output_path=str(out))
+    with pytest.raises(FileExistsError):
+        convert_from_hf(job=job, hf_repo="org/model")
+
+
+def test_convert_from_hf_unknown_type_raises(tmp_path: Path):
+    from mlx_server.conversion.hf import convert_from_hf
+
+    out = tmp_path / "out"
+    job = ConversionJob(id="c-hf3", source="hf", model_type="bogus", output_path=str(out))
+    with pytest.raises(ValueError, match="Unknown model_type"):
+        convert_from_hf(job=job, hf_repo="org/model")
+
+
+# ---------------------------------------------------------------------------
+# Job execution + retention
+# ---------------------------------------------------------------------------
+
+
+def test_job_manager_runs_worker_to_completion(tmp_path: Path):
+    mgr = JobManager()
+    ran = {}
+
+    def worker(job: ConversionJob):
+        ran["yes"] = True
+        job.progress = "done"
+
+    job = mgr.submit("hf", "generative", str(tmp_path / "o"), worker)
+    _wait_for(lambda: job.status == JobStatus.COMPLETED)
+
+    assert ran.get("yes") is True
+    assert job.completed_at is not None
+    assert job.progress == "done"
+
+
+def test_job_manager_prunes_overflow_completed_jobs():
+    import time
+
+    mgr = JobManager(max_jobs=2, retention_seconds=0)
+    for i in range(4):
+        j = ConversionJob(
+            id=f"c{i}",
+            source="hf",
+            model_type="generative",
+            output_path=f"/tmp/{i}",
+            status=JobStatus.COMPLETED,
+            created_at=time.time() + i,
+            completed_at=time.time() + i,
+        )
+        mgr._jobs[j.id] = j
+
+    listed = mgr.list_all()
+    assert len(listed) == 2
+    ids = [j.id for j in listed]
+    assert "c3" in ids and "c2" in ids  # newest kept
+    assert "c0" not in ids and "c1" not in ids  # oldest pruned

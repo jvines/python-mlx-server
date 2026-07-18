@@ -7,7 +7,6 @@ Clients poll GET /v1/convert/{job_id} or stream SSE from /v1/convert/{job_id}/st
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import shutil
 import threading
@@ -122,10 +121,13 @@ class JobManager:
             self._jobs[job_id] = job
             self._prune_locked()
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
+        # Whether the output path already existed BEFORE this job ran. The
+        # workers raise FileExistsError up front when the path exists, so they
+        # never create a pre-existing directory — and failure-cleanup must not
+        # delete it. Deleting here would destroy a directory the user merely
+        # pointed us at by mistake (or is retrying against). Only prune output
+        # that this job actually created.
+        output_pre_existed = Path(job.output_path).exists()
 
         def _run() -> None:
             with self._jobs_lock:
@@ -136,11 +138,21 @@ class JobManager:
                     job.status = JobStatus.COMPLETED
                     job.completed_at = time.time()
             except Exception as exc:
+                logger.exception("Conversion job %s failed", job.id)
                 with self._jobs_lock:
                     job.status = JobStatus.FAILED
-                    job.error = str(exc)
+                    job.error = f"{type(exc).__name__}: {exc}"
                     job.completed_at = time.time()
-                # Remove partial output so a retry doesn't hit FileExistsError
+                if output_pre_existed:
+                    logger.warning(
+                        "Job %s failed; output path pre-existed and was left "
+                        "untouched: %s",
+                        job.id,
+                        job.output_path,
+                    )
+                    return
+                # Remove partial output THIS job created so a retry doesn't hit
+                # FileExistsError.
                 out = Path(job.output_path)
                 if out.exists():
                     logger.warning("Job %s failed — removing partial output: %s", job.id, out)
@@ -149,7 +161,7 @@ class JobManager:
                     else:
                         out.unlink(missing_ok=True)
 
-        loop.run_in_executor(self._get_executor(), _run)
+        self._get_executor().submit(_run)
         return job
 
     def shutdown(self) -> None:

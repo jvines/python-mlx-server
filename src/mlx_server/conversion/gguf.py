@@ -4,7 +4,7 @@ GGUF → MLX direct conversion.
 Reads a local GGUF file with mx.load (no external GGUF library needed) and
 saves weights in the HF/transformers convention that mlx_lm expects.
 
-Supported GGUF architectures: llama, qwen2, qwen2moe, mistral, mistral3, gemma, gemma2
+Supported GGUF architectures: llama, qwen2, qwen2moe, mistral, mistral3, gemma, gemma2, granite
 Tokenizer must be downloaded from HF — provide hf_tokenizer_repo.
 
 Memory notes:
@@ -179,7 +179,9 @@ def _to_python(val: Any) -> Any:
     return val
 
 
-def _detect_quantization(weights: Dict[str, mx.array]) -> Optional[Dict[str, int]]:
+def _detect_quantization(
+    weights: Dict[str, mx.array], known_bits: Optional[int] = None
+) -> Optional[Dict[str, int]]:
     """
     Infer MLX quantization params from weight/scales tensor shapes.
 
@@ -188,7 +190,18 @@ def _detect_quantization(weights: Dict[str, mx.array]) -> Optional[Dict[str, int
       bits=4 → 8 nibbles per uint32 → packed_in = original_in // 8
 
     group_size = original_in / n_scale_groups
+
+    Shapes alone CANNOT disambiguate 4-bit from 8-bit: a 4-bit / group_size=64
+    layer and an 8-bit / group_size=32 layer produce identical tensor shapes,
+    and trying bits=8 first would misread the former as the latter. When the
+    bit width is already known — because we just applied it, or the GGUF
+    ``file_type`` declares it — pass ``known_bits`` to pin it and derive only
+    the group_size.
     """
+    if known_bits in (4, 8):
+        candidates = ((known_bits, 32 // known_bits),)
+    else:
+        candidates = ((8, 4), (4, 8))
     for key, w in weights.items():
         if not key.endswith(".weight") or w.ndim != 2:
             continue
@@ -197,7 +210,7 @@ def _detect_quantization(weights: Dict[str, mx.array]) -> Optional[Dict[str, int
         if s is None or s.ndim != 2:
             continue
         packed_in, n_groups = w.shape[1], s.shape[1]
-        for bits, pack_factor in ((8, 4), (4, 8)):
+        for bits, pack_factor in candidates:
             original_in = packed_in * pack_factor
             if n_groups and original_in % n_groups == 0:
                 group_size = original_in // n_groups
@@ -207,7 +220,38 @@ def _detect_quantization(weights: Dict[str, mx.array]) -> Optional[Dict[str, int
     return None
 
 
-def _build_config(arch: str, meta: Dict[str, Any], weights: Dict[str, mx.array]) -> Dict[str, Any]:
+# GGUF general.file_type enum → MLX quant bit width, for the quantized types
+# MLX's GGUF loader materialises as packed (weight/scales/biases) triples.
+# K-quants and float types are intentionally absent: MLX dequantises those on
+# load, so _is_already_quantized() is False for them and this map is not
+# consulted.
+_GGUF_FILE_TYPE_BITS = {
+    2: 4,   # MOSTLY_Q4_0
+    3: 4,   # MOSTLY_Q4_1
+    7: 8,   # MOSTLY_Q8_0
+    # Q5_0 (8), Q5_1 (9) and the K-quants are intentionally absent: MLX's loader
+    # dequantizes them to float on load, so they never reach the already-
+    # quantized branch and must fall back to shape inference (returns None).
+}
+
+
+def _gguf_file_type_bits(meta: Dict[str, Any]) -> Optional[int]:
+    """Bit width declared by the GGUF ``general.file_type``, if recognised."""
+    ft = _to_python(meta.get("general.file_type"))
+    if ft is None:
+        return None
+    try:
+        return _GGUF_FILE_TYPE_BITS.get(int(ft))
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_config(
+    arch: str,
+    meta: Dict[str, Any],
+    weights: Dict[str, mx.array],
+    quant_override: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     model_type = _ARCH_MODEL_TYPE[arch]
 
     def _get(template: str):
@@ -236,8 +280,12 @@ def _build_config(arch: str, meta: Dict[str, Any], weights: Dict[str, mx.array])
         if n is not None:
             config["vocab_size"] = int(n)
 
-    # Quantization config — tells mlx_lm to build QuantizedLinear layers
-    q_info = _detect_quantization(weights)
+    # Quantization config — tells mlx_lm how to build QuantizedLinear layers.
+    # Prefer the params we actually applied (or that the GGUF file_type
+    # declared) over re-inferring from shapes, which cannot reliably tell
+    # 4-bit from 8-bit and would otherwise write a mismatched block that makes
+    # mlx_lm.load build the wrong layers.
+    q_info = quant_override if quant_override is not None else _detect_quantization(weights)
     if q_info:
         config["quantization"] = q_info
 
@@ -740,9 +788,17 @@ def convert_from_gguf(
                 len(remapped) + n_skipped, len(remapped), n_skipped, t_remap)
 
     # ── 3. Optionally re-quantize ────────────────────────────────────────────
+    # The exact quantization we end up with, threaded into config.json instead
+    # of being re-inferred from tensor shapes (which cannot reliably tell 4-bit
+    # from 8-bit apart).
+    applied_quant: Optional[Dict[str, int]] = None
     already_q = _is_already_quantized(remapped)
     if already_q:
-        q_info = _detect_quantization(remapped)
+        # Pin bits from the GGUF file_type when it declares a known quantized
+        # type; otherwise fall back to (ambiguous) shape inference.
+        known_bits = _gguf_file_type_bits(metadata)
+        q_info = _detect_quantization(remapped, known_bits=known_bits)
+        applied_quant = q_info
         bits_str = f"Q{q_info['bits']}_0" if q_info else "quantized"
         job.progress = f"Weights already {bits_str} — skipping re-quantization"
         logger.info("gguf_quant: already %s (group_size=%s) — skipping",
@@ -752,13 +808,14 @@ def convert_from_gguf(
         logger.info("gguf_quant: quantizing to %d-bit, group_size=%d ...", q_bits, q_group_size)
         t_q = time.monotonic()
         remapped = _quantize_weights(remapped, q_bits, q_group_size)
+        applied_quant = {"bits": q_bits, "group_size": q_group_size}
         logger.info("gguf_quant: done  %.1fs", time.monotonic() - t_q)
     else:
         logger.info("gguf_quant: quantize=False, keeping fp16")
 
     # ── 4. Build config.json ─────────────────────────────────────────────────
     job.progress = "Writing config.json"
-    config = _build_config(arch, metadata, remapped)
+    config = _build_config(arch, metadata, remapped, quant_override=applied_quant)
     (output / "config.json").write_text(json.dumps(config, indent=2))
     logger.info("gguf_config: model_type=%s  vocab_size=%s  quantization=%s",
                 config.get("model_type"), config.get("vocab_size"),
