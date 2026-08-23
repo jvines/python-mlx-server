@@ -6,13 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.133.0",
-    "mlx>=0.30.6",
-    "mlx-lm>=0.30.7",
+    "mlx>=0.32.0",
+    "mlx-lm>=0.31.3",
     "mlx-embeddings>=0.0.5",
-    "mlx-vlm>=0.1.25",
+    "mlx-vlm>=0.6.15",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.13.1",
     "uvicorn[standard]>=0.41.0",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
 ]
 
 [dependency-groups]
