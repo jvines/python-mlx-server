@@ -176,7 +176,9 @@ async def test_stream_forwards_kv_and_sampler_kwargs(monkeypatch):
         yield object()
 
     monkeypatch.setattr(mgr, "load_model", fake_load)
-    monkeypatch.setattr(gm, "stream_generate", fake_stream_generate)
+    # stream_generate is imported inside GenerativeModelManager.stream so that
+    # mlx_lm stays out of module-import time; patch it at its source.
+    monkeypatch.setattr("mlx_lm.stream_generate", fake_stream_generate)
 
     chunks = []
     async for chunk in mgr.stream(
@@ -210,7 +212,9 @@ async def test_stream_aclose_releases_in_use(monkeypatch):
             yield object()
 
     monkeypatch.setattr(mgr, "load_model", fake_load)
-    monkeypatch.setattr(gm, "stream_generate", fake_stream_generate)
+    # stream_generate is imported inside GenerativeModelManager.stream so that
+    # mlx_lm stays out of module-import time; patch it at its source.
+    monkeypatch.setattr("mlx_lm.stream_generate", fake_stream_generate)
 
     agen = mgr.stream("m", "/p", [{"role": "user", "content": "hi"}]).__aiter__()
     await agen.__anext__()

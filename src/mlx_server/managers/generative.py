@@ -20,10 +20,18 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import mlx.core as mx
-from mlx_lm import load, stream_generate
-from mlx_lm.sample_utils import make_sampler
 
 logger = logging.getLogger(__name__)
+
+
+def _check_mlx_lm() -> None:
+    try:
+        import mlx_lm  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "mlx-lm is not installed. "
+            "Run: uv add mlx-lm"
+        )
 
 # Single-threaded executor: MLX Metal operations serialize on the GPU anyway,
 # and this prevents multiple threads from competing for unified memory.
@@ -38,6 +46,9 @@ def _load_with_progress(model_id: str, path: str) -> Tuple[Any, Any]:
     and logged with a running byte percentage — same approach as llama.cpp.
     Safe because the generative executor is single-threaded (max_workers=1).
     """
+    _check_mlx_lm()
+    from mlx_lm import load
+
     model_path = Path(path)
     shard_files = sorted(model_path.glob("*.safetensors"))
     total_bytes = sum(f.stat().st_size for f in shard_files)
@@ -202,6 +213,10 @@ class GenerativeModelManager:
     ) -> AsyncGenerator[Any, None]:
         model, tokenizer = await self.load_model(model_id, path)
         prompt = self._build_prompt(tokenizer, messages, enable_thinking=enable_thinking)
+
+        _check_mlx_lm()
+        from mlx_lm import stream_generate
+        from mlx_lm.sample_utils import make_sampler
 
         sampler = make_sampler(temp=temperature, top_p=top_p)
         kwargs: Dict[str, Any] = {"max_tokens": max_tokens, "sampler": sampler}
