@@ -197,9 +197,16 @@ POST /v1/convert/download
   "hf_repo": "mlx-community/Qwen3-8B-4bit-DWQ",
   "output_path": "/path/to/output",
   "model_type": "generative",
+  "allow_patterns": ["8-bit/*"],   # optional: fetch only part of the repo
   "register_as": "qwen3-8b-mlx"
 }
 ```
+
+> **Use `allow_patterns` on multi-quant repos.** Many MLX publishers ship every
+> precision as its own subfolder, often alongside a root copy and an MTP drafter.
+> `orcarouter/Qwen3.8-27B-Uncensored-MLX` is 94.7 GB in full for a 27.5 GB model —
+> `"allow_patterns": ["8-bit/*"]` fetches just the one you want. Omit it to download
+> the whole repo.
 
 > **Note on K-quant GGUFs (Q4_K_M, Q5_K_S, etc.):** `mx.load` dequantizes these to float16.
 > A 70B K-quant model requires ~140 GB intermediate RAM — use the HF path for 70B models.
