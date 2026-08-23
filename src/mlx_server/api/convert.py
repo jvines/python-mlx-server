@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -145,6 +145,16 @@ class HFDownloadRequest(BaseModel):
     hf_repo: str = Field(..., description="HuggingFace repo ID of a pre-converted MLX model")
     output_path: str = Field(..., description="Absolute local path to download into")
     model_type: Literal["generative", "embedding", "vlm"] = "generative"
+    allow_patterns: Optional[List[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Glob patterns limiting which repo files are fetched, e.g. ['8-bit/*']. "
+            "Many MLX repos ship every precision as a separate subfolder (plus an "
+            "MTP drafter), so omitting this can download several times the size of "
+            "the model you actually want. Omit to fetch the whole repo."
+        ),
+    )
     register_as: Optional[str] = Field(
         default=None,
         description="If set, register the model under this ID after download",
@@ -172,7 +182,10 @@ async def download_from_hf_endpoint(request: HFDownloadRequest):
         if output.exists():
             raise FileExistsError(f"Output path already exists: {output}")
         job.progress = f"Downloading {request.hf_repo}"
-        snapshot_download(repo_id=request.hf_repo, local_dir=str(output))
+        extra = {}
+        if request.allow_patterns is not None:
+            extra["allow_patterns"] = request.allow_patterns
+        snapshot_download(repo_id=request.hf_repo, local_dir=str(output), **extra)
         if job.register_as:
             registry.register(job.register_as, job.output_path, job.model_type, overwrite=True)
 

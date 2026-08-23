@@ -21,6 +21,22 @@ from mlx_server.conversion.jobs import ConversionJob, JobStatus, JobManager
 client = TestClient(app, raise_server_exceptions=False)
 
 
+@pytest.fixture(autouse=True)
+def _never_download(request):
+    """Hard stop on real HuggingFace downloads.
+
+    ``/v1/convert/download`` binds ``snapshot_download`` as a closure local, so
+    a test that forgets to patch it will happily fetch tens of gigabytes. Tests
+    that need to assert on the call opt in via the ``real_snapshot_patch``
+    marker-free helper below, which patches it again for its own assertions.
+    """
+    with patch("huggingface_hub.snapshot_download") as guard:
+        guard.side_effect = AssertionError(
+            "test attempted a real snapshot_download; patch it explicitly"
+        )
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Job manager unit tests
 # ---------------------------------------------------------------------------
@@ -655,3 +671,72 @@ def test_job_manager_prunes_overflow_completed_jobs():
     ids = [j.id for j in listed]
     assert "c3" in ids and "c2" in ids  # newest kept
     assert "c0" not in ids and "c1" not in ids  # oldest pruned
+
+
+# ---------------------------------------------------------------------------
+# /v1/convert/download — allow_patterns passthrough
+# ---------------------------------------------------------------------------
+
+
+def _run_download_worker(payload: dict, tmp_path: Path):
+    """POST to /v1/convert/download, then run the worker the endpoint submitted.
+
+    ``snapshot_download`` is patched for the whole exchange: the endpoint binds
+    it as a closure local, so patching only around the worker call would let a
+    real multi-gigabyte download escape.
+    """
+    job = _make_fake_job(source="download")
+    job.output_path = str(tmp_path / "out")
+    job.register_as = None
+
+    with patch("huggingface_hub.snapshot_download") as mock_dl, \
+            patch("mlx_server.api.convert.job_manager") as mock_jm, \
+            patch("mlx_server.api.convert.registry"):
+        mock_jm.submit.return_value = job
+        resp = client.post("/v1/convert/download", json=payload)
+        assert resp.status_code == 202, resp.text
+        worker = mock_jm.submit.call_args.kwargs["worker_fn"]
+        worker(job)
+
+    return mock_dl
+
+
+def test_download_forwards_allow_patterns_to_snapshot_download(tmp_path: Path):
+    mock_dl = _run_download_worker(
+        {
+            "hf_repo": "orcarouter/Qwen3.8-27B-Uncensored-MLX",
+            "output_path": str(tmp_path / "out"),
+            "model_type": "generative",
+            "allow_patterns": ["8-bit/*"],
+        },
+        tmp_path,
+    )
+
+    mock_dl.assert_called_once()
+    assert mock_dl.call_args.kwargs["allow_patterns"] == ["8-bit/*"]
+
+
+def test_download_without_allow_patterns_fetches_whole_repo(tmp_path: Path):
+    mock_dl = _run_download_worker(
+        {
+            "hf_repo": "mlx-community/Qwen3-8B-4bit",
+            "output_path": str(tmp_path / "out"),
+            "model_type": "generative",
+        },
+        tmp_path,
+    )
+
+    mock_dl.assert_called_once()
+    assert mock_dl.call_args.kwargs.get("allow_patterns") is None
+
+
+def test_download_rejects_empty_allow_patterns(tmp_path: Path):
+    resp = client.post(
+        "/v1/convert/download",
+        json={
+            "hf_repo": "mlx-community/Qwen3-8B-4bit",
+            "output_path": str(tmp_path / "out"),
+            "allow_patterns": [],
+        },
+    )
+    assert resp.status_code == 422
